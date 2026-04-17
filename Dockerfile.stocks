@@ -1,0 +1,28 @@
+# Standalone stock-swarm viz deploy image.
+# Stage 1 builds the Vue/Vite frontend, stage 2 runs Flask + yfinance
+# and serves the built dist. No LLM / Zep / camel-oasis deps.
+
+FROM node:20-alpine AS web
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY locales /app/locales
+COPY frontend ./
+RUN npm run build
+
+FROM python:3.11-slim AS runtime
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    STOCK_SWARM_CACHE=/tmp/stock_swarm_cache \
+    STOCK_SWARM_STATIC=/app/frontend/dist
+
+WORKDIR /app
+COPY backend/requirements-stocks.txt /app/backend/requirements-stocks.txt
+RUN pip install -r /app/backend/requirements-stocks.txt
+
+COPY backend/stock_swarm_server.py /app/backend/stock_swarm_server.py
+COPY --from=web /app/frontend/dist /app/frontend/dist
+
+EXPOSE 5001
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5001} --workers 2 --threads 4 --timeout 120 --chdir /app/backend stock_swarm_server:app"]

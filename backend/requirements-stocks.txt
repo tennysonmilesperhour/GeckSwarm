@@ -1,0 +1,6 @@
+# Minimal deps for the standalone stock-swarm server.
+# Keeps the image small (avoids the camel-oasis / zep / LLM stack).
+flask>=3.0.0
+flask-cors>=6.0.0
+gunicorn>=22.0.0
+yfinance>=0.2.40
