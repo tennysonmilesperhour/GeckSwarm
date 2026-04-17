@@ -314,7 +314,7 @@ function buildScene(payload) {
     const normSeries = normalizeZScore(payload.prices[t.symbol])
     const color = TIER_COLORS[t.tier] ?? 0xffffff
     // Tier scales node size: mega-caps and anchors read as "larger waves".
-    const size = 1.3 - Math.min(0.7, (t.tier - 1) * 0.05)
+    const size = 1.9 - Math.min(0.6, (t.tier - 1) * 0.04)
 
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(size, 16, 12),
@@ -596,21 +596,10 @@ function buildLabels() {
   for (const n of nodes) {
     const el = document.createElement('div')
     el.className = 'ss-label'
-    el.style.setProperty(
-      '--tier',
-      '#' + new THREE.Color(TIER_COLORS[n.tier] ?? 0xffffff).getHexString()
-    )
-    const sym = document.createElement('div')
-    sym.className = 'ss-label-sym'
-    sym.textContent = n.symbol
-    const price = document.createElement('div')
-    price.className = 'ss-label-price'
-    price.textContent = ''
-    el.appendChild(sym)
-    el.appendChild(price)
+    el.textContent = n.symbol
     layer.appendChild(el)
     n.labelEl = el
-    n.labelPriceEl = price
+    n.labelPriceEl = null
     n.labelPrevPrice = null
   }
 }
@@ -628,29 +617,16 @@ function updateLabels() {
   if (!canvas) return
   const w = canvas.clientWidth
   const h = canvas.clientHeight
-  const cIdx = Math.floor(cursorF)
-  const cSafe = Math.max(0, Math.min(totalDays.value - 1, cIdx))
   for (const n of nodes) {
     if (!n.labelEl) continue
     tmpVec.set(n.x, n.mesh.position.y, n.z).project(camera)
     if (tmpVec.z > 1) { n.labelEl.style.opacity = '0'; continue }
     const x = (tmpVec.x * 0.5 + 0.5) * w
     const y = (-tmpVec.y * 0.5 + 0.5) * h
-    // Labels anchored to the right of the node sphere and vertically centered,
-    // so they ride the wave up and down with the node.
-    n.labelEl.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(9px, -50%)`
+    // Centered on the dot's projected position so the label always sits
+    // inside the sphere regardless of camera yaw.
+    n.labelEl.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(-50%, -50%)`
     n.labelEl.style.opacity = '1'
-
-    // Price: color + arrow based on direction since the previous rendered bar.
-    const price = n.rawPrices[cSafe]
-    const txt = price >= 1000 ? price.toFixed(0) : price.toFixed(2)
-    const prev = n.labelPrevPrice
-    if (prev !== null) {
-      const up = price > prev
-      n.labelPriceEl.dataset.dir = price === prev ? 'flat' : (up ? 'up' : 'down')
-    }
-    n.labelPriceEl.textContent = txt
-    n.labelPrevPrice = price
   }
 }
 
@@ -991,37 +967,20 @@ onBeforeUnmount(() => {
   top: 0;
   left: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  line-height: 1.1;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  color: #39ff14;
   white-space: nowrap;
   transform: translate(-9999px, -9999px);
   pointer-events: none;
   will-change: transform;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 1px;
-}
-.ss-label-sym {
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0.10em;
-  color: #fff;
   text-shadow:
-    0 0 2px #000,
-    0 0 5px #000,
-    0 0 10px var(--tier, #6fd6ff);
+    0 0 1px #000,
+    0 0 3px rgba(0, 0, 0, 0.95),
+    0 0 6px #39ff14;
 }
-.ss-label-price {
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  color: #d9e8f0;
-  opacity: 0.78;
-  text-shadow: 0 0 3px #000, 0 0 6px #000;
-}
-.ss-label-price[data-dir="up"]   { color: #6fffb2; }
-.ss-label-price[data-dir="down"] { color: #ff6f80; }
-.ss-label-price[data-dir="flat"] { color: #d9e8f0; }
 .stock-swarm-error {
   position: absolute;
   bottom: 20px;
