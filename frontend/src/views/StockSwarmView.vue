@@ -12,6 +12,18 @@
     </div>
     <div v-if="loadError" class="stock-swarm-error">{{ loadError }}</div>
 
+    <div class="stock-swarm-source">
+      <label>
+        <input type="radio" value="stub" v-model="source" @change="reload" />
+        stub
+      </label>
+      <label>
+        <input type="radio" value="real" v-model="source" @change="reload" />
+        real (yfinance)
+      </label>
+      <span v-if="sourceLabel" class="source-label">{{ sourceLabel }}</span>
+    </div>
+
     <div v-if="loaded" class="stock-swarm-controls">
       <button class="ctrl-btn" @click="togglePlay">
         {{ playing ? '❙❙' : '▶' }}
@@ -52,6 +64,8 @@ const tickerCount = ref(0)
 const datesRef = ref([])
 const playing = ref(true)
 const playSpeed = ref(1.2)
+const source = ref('stub')
+const sourceLabel = ref('')
 
 const currentDate = computed(() => datesRef.value[cursor.value] ?? '')
 
@@ -249,16 +263,54 @@ function animate(t) {
   renderer.render(scene, camera)
 }
 
+async function fetchStub() {
+  const res = await fetch('/stock-swarm/stub.json', { cache: 'force-cache' })
+  if (!res.ok) throw new Error(`stub HTTP ${res.status}`)
+  const p = await res.json()
+  p.source = 'stub'
+  return p
+}
+
+async function fetchReal() {
+  // Backend may redirect us back to the stub if yfinance isn't available;
+  // in that case we fetch the stub ourselves and mark the source accordingly.
+  const res = await fetch('/api/stock-swarm/prices?period=2y')
+  if (!res.ok) throw new Error(`api HTTP ${res.status}`)
+  const p = await res.json()
+  if (p.source === 'stub' || !p.prices) {
+    const stub = await fetchStub()
+    stub.source = 'stub (fallback: ' + (p.fallback_reason || 'no-data') + ')'
+    return stub
+  }
+  return p
+}
+
+function clearScene() {
+  for (const n of nodes) {
+    scene.remove(n.mesh); scene.remove(n.trail)
+    n.mesh.geometry.dispose(); n.mesh.material.dispose()
+    n.trailGeom.dispose(); n.trail.material.dispose()
+  }
+  nodes = []
+}
+
 async function loadData() {
   try {
-    const res = await fetch('/stock-swarm/stub.json', { cache: 'force-cache' })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const payload = await res.json()
+    loaded.value = false
+    loadError.value = ''
+    clearScene()
+    const payload = source.value === 'real' ? await fetchReal() : await fetchStub()
     buildScene(payload)
+    sourceLabel.value = payload.source || source.value
+    cursor.value = 0
     loaded.value = true
   } catch (e) {
-    loadError.value = `Failed to load stub.json: ${e.message}`
+    loadError.value = `Failed to load data: ${e.message}`
   }
+}
+
+function reload() {
+  loadData()
 }
 
 onMounted(async () => {
@@ -400,5 +452,30 @@ onBeforeUnmount(() => {
 .ctrl-speed input {
   width: 90px;
   accent-color: #6fd6ff;
+}
+.stock-swarm-source {
+  position: absolute;
+  top: 16px;
+  right: 20px;
+  color: #9fd2ff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(5, 8, 15, 0.55);
+  padding: 6px 10px;
+  border: 1px solid rgba(111, 214, 255, 0.18);
+  border-radius: 4px;
+}
+.stock-swarm-source label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.source-label {
+  opacity: 0.6;
+  font-size: 10px;
 }
 </style>
