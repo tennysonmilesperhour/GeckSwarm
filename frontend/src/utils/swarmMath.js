@@ -112,7 +112,8 @@ export function correlationEmbedding(matrix, targetSpan = 130) {
   const [e1, e2] = topKEigen(matrix, 2)
   const s1 = Math.sqrt(Math.max(0, Math.abs(e1.value)))
   const s2 = Math.sqrt(Math.max(0, Math.abs(e2.value)))
-  const raw = e1.vector.map((v, i) => [v * s1, e2.vector[i] * s2])
+  // Array.from so the pairs survive — Float32Array#map would coerce [x, y] to NaN.
+  const raw = Array.from(e1.vector, (v, i) => [v * s1, e2.vector[i] * s2])
   // Normalize to targetSpan
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
   for (const [x, y] of raw) {
