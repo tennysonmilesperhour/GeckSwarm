@@ -49,25 +49,47 @@
     </div>
 
     <div v-if="loaded" class="stock-swarm-controls">
-      <button class="ctrl-btn" @click="togglePlay">
+      <button class="ctrl-btn" @click="togglePlay" :title="playing ? 'Pause' : 'Play'">
         {{ playing ? '❙❙' : '▶' }}
       </button>
-      <input
-        class="ctrl-scrub"
-        type="range"
-        :min="0"
-        :max="totalDays - 1"
-        :value="cursor"
-        @input="onScrub"
-      />
+
+      <div
+        ref="trackRef"
+        class="ctrl-track"
+        @pointerdown="onTrackPointerDown"
+        @pointermove="onTrackHover"
+        @pointerleave="hoverPct = -1"
+      >
+        <div class="track-fill" :style="{ width: cursorPct + '%' }" />
+
+        <div
+          v-for="ev in eventMarkers"
+          :key="ev.date"
+          class="track-event"
+          :style="{ left: ev.pct + '%', background: ev.color }"
+          :title="ev.date + ' — ' + ev.label"
+        />
+
+        <div class="track-thumb" :style="{ left: cursorPct + '%' }" />
+
+        <div
+          v-if="hoverPct >= 0"
+          class="track-preview"
+          :style="{ left: hoverPct + '%' }"
+        >
+          {{ hoverDate }}
+        </div>
+      </div>
+
       <div class="ctrl-dates">
         <span>{{ datesRef[0] }}</span>
         <span class="ctrl-now">{{ currentDate }}</span>
         <span>{{ datesRef[totalDays - 1] }}</span>
       </div>
+
       <label class="ctrl-speed">
         speed
-        <input type="range" min="0.1" max="10" step="0.1" v-model.number="playSpeed" />
+        <input type="range" min="0.1" max="20" step="0.1" v-model.number="playSpeed" />
         <span>{{ playSpeed.toFixed(1) }}x</span>
       </label>
     </div>
@@ -80,6 +102,8 @@ import * as THREE from 'three'
 import { ar1Fit, correlationEmbedding, correlationMatrix, seriesStats } from '../utils/swarmMath.js'
 
 const canvasRef = ref(null)
+const trackRef = ref(null)
+const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
 const cursor = ref(0)
@@ -107,9 +131,78 @@ function togglePlay() {
   playing.value = !playing.value
 }
 
-function onScrub(ev) {
-  const next = parseInt(ev.target.value, 10)
-  jumpCursor(next)
+const cursorPct = computed(() =>
+  totalDays.value > 1 ? (cursor.value / (totalDays.value - 1)) * 100 : 0
+)
+const hoverDate = computed(() => {
+  if (hoverPct.value < 0 || totalDays.value === 0) return ''
+  const idx = Math.round((hoverPct.value / 100) * (totalDays.value - 1))
+  return datesRef.value[idx] ?? ''
+})
+const eventMarkers = computed(() => {
+  if (totalDays.value < 2) return []
+  return events.map(e => ({
+    date: e.date,
+    label: e.label,
+    color: e.color,
+    pct: (e.dayIndex / (totalDays.value - 1)) * 100,
+  }))
+})
+
+function pctFromPointer(evt) {
+  const el = trackRef.value
+  if (!el) return 0
+  const rect = el.getBoundingClientRect()
+  const x = (evt.clientX - rect.left) / rect.width
+  return Math.max(0, Math.min(1, x)) * 100
+}
+
+function onTrackHover(evt) {
+  hoverPct.value = pctFromPointer(evt)
+}
+
+function onTrackPointerDown(evt) {
+  const el = trackRef.value
+  if (!el) return
+  el.setPointerCapture?.(evt.pointerId)
+  const wasPlaying = playing.value
+  playing.value = false
+
+  const drag = ev => {
+    const pct = pctFromPointer(ev)
+    const idx = Math.round((pct / 100) * (totalDays.value - 1))
+    jumpCursor(idx)
+    hoverPct.value = pct
+  }
+  const up = ev => {
+    el.removeEventListener('pointermove', drag)
+    el.removeEventListener('pointerup', up)
+    el.removeEventListener('pointercancel', up)
+    el.releasePointerCapture?.(ev.pointerId)
+    playing.value = wasPlaying
+  }
+  el.addEventListener('pointermove', drag)
+  el.addEventListener('pointerup', up)
+  el.addEventListener('pointercancel', up)
+  drag(evt)
+}
+
+function onKeydown(evt) {
+  if (!loaded.value) return
+  const tag = document.activeElement?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  const step = evt.shiftKey ? 20 : 1
+  if (evt.key === 'ArrowRight') {
+    jumpCursor(cursor.value + step); evt.preventDefault()
+  } else if (evt.key === 'ArrowLeft') {
+    jumpCursor(cursor.value - step); evt.preventDefault()
+  } else if (evt.key === ' ') {
+    togglePlay(); evt.preventDefault()
+  } else if (evt.key === 'Home') {
+    jumpCursor(0); evt.preventDefault()
+  } else if (evt.key === 'End') {
+    jumpCursor(totalDays.value - 1); evt.preventDefault()
+  }
 }
 
 // Visual config
@@ -506,17 +599,28 @@ async function fetchStub() {
 }
 
 async function fetchReal() {
-  // Backend may redirect us back to the stub if yfinance isn't available;
-  // in that case we fetch the stub ourselves and mark the source accordingly.
-  const res = await fetch('/api/stock-swarm/prices?period=2y')
-  if (!res.ok) throw new Error(`api HTTP ${res.status}`)
-  const p = await res.json()
-  if (p.source === 'stub' || !p.prices) {
-    const stub = await fetchStub()
-    stub.source = 'stub (fallback: ' + (p.fallback_reason || 'no-data') + ')'
-    return stub
+  // Backend may be missing (frontend-only Vercel deploy), return a stub-fallback;
+  // may also redirect us back to the stub if yfinance isn't available.
+  let reason = null
+  let payload = null
+  try {
+    const res = await fetch('/api/stock-swarm/prices?period=2y')
+    if (!res.ok) {
+      reason = `api_http_${res.status}`
+    } else {
+      payload = await res.json()
+      if (payload.source === 'stub' || !payload.prices) {
+        reason = payload.fallback_reason || 'no-data'
+        payload = null
+      }
+    }
+  } catch (e) {
+    reason = 'api_unreachable'
   }
-  return p
+  if (payload) return payload
+  const stub = await fetchStub()
+  stub.source = `stub (fallback: ${reason || 'unknown'})`
+  return stub
 }
 
 function clearScene() {
@@ -595,6 +699,8 @@ onMounted(async () => {
   resizeObserver = new ResizeObserver(handleResize)
   resizeObserver.observe(canvas.parentElement)
 
+  window.addEventListener('keydown', onKeydown)
+
   await loadData()
   animate(0)
 })
@@ -602,6 +708,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (rafId) cancelAnimationFrame(rafId)
   if (resizeObserver) resizeObserver.disconnect()
+  window.removeEventListener('keydown', onKeydown)
   clearScene()
   if (renderer) renderer.dispose()
 })
@@ -682,9 +789,55 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 .ctrl-btn:hover { background: rgba(111, 214, 255, 0.18); }
-.ctrl-scrub {
+.ctrl-track {
+  position: relative;
+  height: 28px;
   width: 100%;
-  accent-color: #6fd6ff;
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  background: linear-gradient(90deg, rgba(111, 214, 255, 0.08), rgba(111, 214, 255, 0.02));
+  border: 1px solid rgba(111, 214, 255, 0.2);
+  border-radius: 4px;
+}
+.track-fill {
+  position: absolute;
+  top: 0; left: 0; bottom: 0;
+  background: linear-gradient(90deg, rgba(111, 214, 255, 0.18), rgba(111, 214, 255, 0.35));
+  pointer-events: none;
+}
+.track-event {
+  position: absolute;
+  top: 4px; bottom: 4px;
+  width: 2px;
+  margin-left: -1px;
+  opacity: 0.85;
+  box-shadow: 0 0 6px currentColor;
+  pointer-events: auto;
+  cursor: help;
+}
+.track-thumb {
+  position: absolute;
+  top: -3px; bottom: -3px;
+  width: 3px;
+  margin-left: -1.5px;
+  background: #a0f0ff;
+  border-radius: 2px;
+  box-shadow: 0 0 10px #6fd6ff, 0 0 2px #fff;
+  pointer-events: none;
+}
+.track-preview {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  transform: translateX(-50%);
+  padding: 2px 6px;
+  background: rgba(5, 8, 15, 0.92);
+  color: #a0f0ff;
+  font-size: 10px;
+  border: 1px solid rgba(111, 214, 255, 0.3);
+  border-radius: 3px;
+  pointer-events: none;
+  white-space: nowrap;
 }
 .ctrl-dates {
   display: flex;
