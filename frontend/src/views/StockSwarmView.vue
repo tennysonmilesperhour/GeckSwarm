@@ -18,6 +18,19 @@
       <span class="evt-label">{{ activeEvent.label }}</span>
     </div>
 
+    <div
+      v-if="loaded"
+      class="stock-swarm-wind"
+      :style="windHudStyle"
+      :data-wind-sign="wind >= 0 ? 'pos' : 'neg'"
+    >
+      <span>wind</span>
+      <span class="wind-bar">
+        <span class="wind-fill" :style="{ width: windFillPct + '%' }" />
+      </span>
+      <span class="wind-val">{{ windLabel }}</span>
+    </div>
+
     <div class="stock-swarm-source">
       <label>
         <input type="radio" value="stub" v-model="source" @change="reload" />
@@ -73,6 +86,13 @@ const playSpeed = ref(1.2)
 const source = ref('stub')
 const sourceLabel = ref('')
 const activeEvent = ref(null)
+const wind = ref(0)   // smoothed breadth in [-1, +1]
+
+const windFillPct = computed(() => Math.min(100, Math.abs(wind.value) * 100))
+const windLabel = computed(() => (wind.value >= 0 ? '+' : '−') + Math.abs(wind.value).toFixed(2))
+const windHudStyle = computed(() => ({
+  '--wind-color': wind.value >= 0 ? '#50fa7b' : '#ff5555',
+}))
 
 const currentDate = computed(() => datesRef.value[cursor.value] ?? '')
 
@@ -111,6 +131,13 @@ let nodeBySymbol = new Map()
 let events = []      // [{ date, dayIndex, label, color, magnitude, tickers, rings: [Mesh] }]
 const EVENT_WINDOW_DAYS = 18   // how many bars on each side of the event show rings
 const RING_MAX_RADIUS = 12
+
+let breadthSeries = null     // Float32Array: per-day breadth in [-1, +1]
+let windField = null         // { points, positions, colors, velocities }
+const WIND_PARTICLES = 260
+const WIND_BOUNDS = 150       // half-extent of the wind box
+const WIND_Y_MIN = 18
+const WIND_Y_MAX = 34
 
 function handleResize() {
   if (!renderer || !camera || !canvasRef.value) return
@@ -154,6 +181,9 @@ function buildScene(payload) {
   const corr = correlationMatrix(symbols, payload.prices)
   const embedding = correlationEmbedding(corr, LAYOUT_SPAN)
 
+  // Market breadth per day: 2 * fraction-positive - 1, in [-1, +1].
+  breadthSeries = computeBreadth(symbols, payload.prices, payload.dates.length)
+
   payload.tickers.forEach((t, idx) => {
     const col = idx % GRID_COLS
     const row = Math.floor(idx / GRID_COLS)
@@ -194,6 +224,80 @@ function buildScene(payload) {
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
   })
+}
+
+function computeBreadth(symbols, prices, days) {
+  const out = new Float32Array(days)
+  // day 0 has no prior bar; leave at 0.
+  for (let d = 1; d < days; d++) {
+    let pos = 0
+    for (const s of symbols) {
+      const p = prices[s]
+      if (!p || p.length <= d) continue
+      if (p[d] > p[d - 1]) pos++
+    }
+    out[d] = (pos / symbols.length) * 2 - 1
+  }
+  // Smooth with a short EMA so the wind doesn't jitter every frame.
+  const alpha = 0.2
+  for (let d = 1; d < days; d++) out[d] = alpha * out[d] + (1 - alpha) * out[d - 1]
+  return out
+}
+
+function buildWindField() {
+  disposeWindField()
+  const positions = new Float32Array(WIND_PARTICLES * 3)
+  const colors = new Float32Array(WIND_PARTICLES * 3)
+  const velocities = new Float32Array(WIND_PARTICLES)
+  for (let i = 0; i < WIND_PARTICLES; i++) {
+    positions[i * 3]     = (Math.random() * 2 - 1) * WIND_BOUNDS
+    positions[i * 3 + 1] = WIND_Y_MIN + Math.random() * (WIND_Y_MAX - WIND_Y_MIN)
+    positions[i * 3 + 2] = (Math.random() * 2 - 1) * WIND_BOUNDS
+    velocities[i] = 0.6 + Math.random() * 0.8
+  }
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  const mat = new THREE.PointsMaterial({
+    size: 0.9, vertexColors: true, transparent: true, opacity: 0.7, depthWrite: false,
+  })
+  const points = new THREE.Points(geom, mat)
+  scene.add(points)
+  windField = { points, positions, colors, velocities, geom, mat }
+}
+
+function disposeWindField() {
+  if (!windField) return
+  scene.remove(windField.points)
+  windField.geom.dispose()
+  windField.mat.dispose()
+  windField = null
+}
+
+function updateWind(c, dt) {
+  if (!breadthSeries || !windField) return
+  const raw = breadthSeries[c] ?? 0
+  // One more pass of smoothing against the reactive value so the HUD also eases.
+  wind.value = wind.value * 0.9 + raw * 0.1
+  const w = wind.value
+  const speedScale = 22  // units per second at |w|=1
+  const { positions, colors, velocities } = windField
+  const gR = w < 0 ? 1 : (1 - w) * 0.3 + 0.1
+  const gG = w > 0 ? 1 : (1 + w) * 0.3 + 0.1
+  const gB = 0.25
+  for (let i = 0; i < WIND_PARTICLES; i++) {
+    const dx = w * velocities[i] * speedScale * dt
+    let nx = positions[i * 3] + dx
+    if (nx > WIND_BOUNDS) nx -= WIND_BOUNDS * 2
+    else if (nx < -WIND_BOUNDS) nx += WIND_BOUNDS * 2
+    positions[i * 3] = nx
+
+    colors[i * 3]     = gR
+    colors[i * 3 + 1] = gG
+    colors[i * 3 + 2] = gB
+  }
+  windField.geom.attributes.position.needsUpdate = true
+  windField.geom.attributes.color.needsUpdate = true
 }
 
 function buildEvents(eventsJson, dates) {
@@ -314,6 +418,7 @@ function animate(t) {
   lastT = t
 
   easeLayout()
+  updateWind(cursor.value, dt)
 
   if (playing.value) {
     animate._acc = (animate._acc ?? 0) + dt * playSpeed.value
@@ -375,6 +480,8 @@ function clearScene() {
   }
   events = []
   activeEvent.value = null
+  disposeWindField()
+  breadthSeries = null
 }
 
 async function loadEvents() {
@@ -397,6 +504,7 @@ async function loadData() {
       loadEvents(),
     ])
     buildScene(payload)
+    buildWindField()
     buildEvents(eventsJson, payload.dates)
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
@@ -607,5 +715,54 @@ onBeforeUnmount(() => {
 .evt-label {
   color: #fff;
   letter-spacing: 0.03em;
+}
+.stock-swarm-wind {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #9fd2ff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: rgba(5, 8, 15, 0.55);
+  border: 1px solid rgba(111, 214, 255, 0.18);
+  border-radius: 4px;
+  pointer-events: none;
+}
+.wind-bar {
+  position: relative;
+  display: inline-block;
+  width: 140px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.wind-fill {
+  position: absolute;
+  top: 0; bottom: 0;
+  left: 50%;
+  width: 0;
+  background: var(--wind-color);
+  transform: translateX(0);
+  transition: width 0.2s linear, background 0.2s linear;
+  box-shadow: 0 0 8px var(--wind-color);
+}
+/* Negative wind shows on the left half of the bar */
+.stock-swarm-wind .wind-fill {
+  transform-origin: left;
+}
+.stock-swarm-wind[data-wind-sign="neg"] .wind-fill {
+  left: auto;
+  right: 50%;
+}
+.wind-val {
+  color: var(--wind-color);
+  min-width: 44px;
+  text-align: right;
 }
 </style>
