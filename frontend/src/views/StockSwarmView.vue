@@ -17,6 +17,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
+import { correlationEmbedding, correlationMatrix } from '../utils/swarmMath.js'
 
 const canvasRef = ref(null)
 const loaded = ref(false)
@@ -34,6 +35,8 @@ const GRID_COLS = 10
 const GRID_ROWS = 5
 const COL_SPACING = 14
 const ROW_SPACING = 14
+const LAYOUT_SPAN = 140          // width/depth of the correlation embedding
+const LAYOUT_EASE = 0.04         // per-frame lerp toward target XZ (0..1)
 const Y_SCALE = 6               // visual amplitude per normalized stdev
 const PLAY_SPEED = 1.2          // bars per second
 const TIER_COLORS = {
@@ -48,7 +51,7 @@ let camera = null
 let rafId = null
 let resizeObserver = null
 let lastT = 0
-let nodes = []       // { symbol, tier, mesh, trail, trailPositions, normSeries, gridX, gridZ }
+let nodes = []       // { symbol, tier, mesh, trail, trailPositions, normSeries, x, z, targetX, targetZ }
 
 function handleResize() {
   if (!renderer || !camera || !canvasRef.value) return
@@ -87,23 +90,30 @@ function buildScene(payload) {
   const originX = -((GRID_COLS - 1) * COL_SPACING) / 2
   const originZ = -((GRID_ROWS - 1) * ROW_SPACING) / 2
 
+  // Compute correlation matrix once, then a 2D embedding via PCA.
+  const symbols = payload.tickers.map(t => t.symbol)
+  const corr = correlationMatrix(symbols, payload.prices)
+  const embedding = correlationEmbedding(corr, LAYOUT_SPAN)
+
   payload.tickers.forEach((t, idx) => {
     const col = idx % GRID_COLS
     const row = Math.floor(idx / GRID_COLS)
     const gridX = originX + col * COL_SPACING
     const gridZ = originZ + row * ROW_SPACING
+    const [targetX, targetZ] = embedding[idx]
 
     const normSeries = normalizeZScore(payload.prices[t.symbol])
     const color = TIER_COLORS[t.tier] ?? 0xffffff
+    // Tier scales node size: mega-caps and anchors read as "larger waves".
+    const size = 1.4 - Math.min(0.8, (t.tier - 1) * 0.06)
 
     const mesh = new THREE.Mesh(
-      new THREE.SphereGeometry(0.9, 16, 12),
+      new THREE.SphereGeometry(size, 16, 12),
       new THREE.MeshBasicMaterial({ color })
     )
     mesh.position.set(gridX, normSeries[0] * Y_SCALE, gridZ)
     scene.add(mesh)
 
-    // Trail as a LineBasicMaterial polyline; positions updated in place each frame.
     const trailPositions = new Float32Array(TRAIL_LEN * 3)
     for (let i = 0; i < TRAIL_LEN; i++) {
       trailPositions[i * 3] = gridX
@@ -118,9 +128,20 @@ function buildScene(payload) {
 
     nodes.push({
       symbol: t.symbol, tier: t.tier, mesh, trail, trailGeom,
-      trailPositions, normSeries, gridX, gridZ,
+      trailPositions, normSeries,
+      x: gridX, z: gridZ,
+      targetX, targetZ,
     })
   })
+}
+
+function easeLayout() {
+  for (const n of nodes) {
+    n.x += (n.targetX - n.x) * LAYOUT_EASE
+    n.z += (n.targetZ - n.z) * LAYOUT_EASE
+    n.mesh.position.x = n.x
+    n.mesh.position.z = n.z
+  }
 }
 
 function updateCursor(delta) {
@@ -131,13 +152,12 @@ function updateCursor(delta) {
     const y = n.normSeries[c] * Y_SCALE
     n.mesh.position.y = y
 
-    // Shift trail back one slot and append current y at the end.
     const p = n.trailPositions
     p.copyWithin(0, 3)
     const last = (TRAIL_LEN - 1) * 3
-    p[last] = n.gridX
+    p[last] = n.x
     p[last + 1] = y
-    p[last + 2] = n.gridZ
+    p[last + 2] = n.z
     n.trailGeom.attributes.position.needsUpdate = true
   }
 }
@@ -147,6 +167,8 @@ function animate(t) {
   if (!lastT) lastT = t
   const dt = (t - lastT) / 1000
   lastT = t
+
+  easeLayout()
 
   // Advance the playhead by fractional bars — integer steps only when we cross.
   animate._acc = (animate._acc ?? 0) + dt * PLAY_SPEED
