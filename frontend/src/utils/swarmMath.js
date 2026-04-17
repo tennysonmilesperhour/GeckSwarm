@@ -37,6 +37,57 @@ export function correlationMatrix(tickerSymbols, prices) {
   return M
 }
 
+// Pearson correlation of series a vs. series b shifted by `lag` bars.
+// lag > 0 aligns a[0..] with b[lag..] (i.e. b lags a by `lag` — "b follows a").
+// lag < 0 aligns a[|lag|..] with b[0..] ("a follows b").
+function laggedPearson(a, b, lag) {
+  const n = a.length
+  const aStart = lag > 0 ? 0 : -lag
+  const bStart = lag > 0 ? lag : 0
+  const len = n - Math.abs(lag)
+  if (len < 2) return 0
+  let ma = 0, mb = 0
+  for (let k = 0; k < len; k++) { ma += a[aStart + k]; mb += b[bStart + k] }
+  ma /= len; mb /= len
+  let num = 0, da = 0, db = 0
+  for (let k = 0; k < len; k++) {
+    const x = a[aStart + k] - ma
+    const y = b[bStart + k] - mb
+    num += x * y; da += x * x; db += y * y
+  }
+  const d = Math.sqrt(da * db)
+  return d === 0 ? 0 : num / d
+}
+
+// Signed max-absolute lead-lag correlation. For each pair (i, j) we scan
+// lag ∈ [-maxLag, +maxLag] and keep the correlation value whose absolute
+// magnitude is largest (sign preserved). This captures:
+//   - tickers that move together (contemporaneous positive)
+//   - tickers that move in opposite directions (negative)
+//   - tickers where one consistently leads / lags the other (non-zero lag)
+// All three push the pair closer in the resulting embedding. Weaker or
+// slower relationships yield smaller magnitude and therefore more distance.
+export function leadLagMatrix(tickerSymbols, prices, maxLag = 5) {
+  const returns = tickerSymbols.map(s => toLogReturns(prices[s]))
+  const n = tickerSymbols.length
+  const M = Array.from({ length: n }, () => new Float32Array(n))
+  for (let i = 0; i < n; i++) {
+    M[i][i] = 1
+    for (let j = i + 1; j < n; j++) {
+      let best = 0
+      let bestAbs = 0
+      for (let lag = -maxLag; lag <= maxLag; lag++) {
+        const c = laggedPearson(returns[i], returns[j], lag)
+        const ac = Math.abs(c)
+        if (ac > bestAbs) { bestAbs = ac; best = c }
+      }
+      M[i][j] = best
+      M[j][i] = best
+    }
+  }
+  return M
+}
+
 // Top-k eigenpairs of a symmetric matrix via power iteration with deflation.
 // Good enough for small matrices (~50x50) where we only need the first few.
 export function topKEigen(matrix, k = 2, iters = 300) {
