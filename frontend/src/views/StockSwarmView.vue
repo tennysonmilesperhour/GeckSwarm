@@ -214,6 +214,11 @@ const ROW_SPACING = 14
 const LAYOUT_SPAN = 140          // width/depth of the correlation embedding
 const LAYOUT_EASE = 0.04         // per-frame lerp toward target XZ (0..1)
 const Y_SCALE = 6               // visual amplitude per normalized stdev
+const BLANKET_SIZE = 200         // world units covered by the water surface
+const BLANKET_SEGMENTS = 72      // per-axis plane subdivision
+const BLANKET_SIGMA = 13.0       // gaussian falloff in world units
+const BLANKET_Y_SCALE = 0.92     // how tall the blanket ripples relative to node Y
+const NODE_COUNT = 50            // hard-coded; matches the universe size
 const TIER_COLORS = {
   1: 0x6fd6ff, 2: 0xa0f0ff, 3: 0xffb86c, 4: 0xff79c6,
   5: 0xffd166, 6: 0xff5555, 7: 0xffa24c, 8: 0x50fa7b,
@@ -231,6 +236,10 @@ let nodeBySymbol = new Map()
 let events = []      // [{ date, dayIndex, label, color, magnitude, tickers, rings: [Mesh] }]
 const EVENT_WINDOW_DAYS = 18   // how many bars on each side of the event show rings
 const RING_MAX_RADIUS = 12
+
+let blanket = null          // { mesh, uniforms, nodeVecs }
+let cursorF = 0             // fractional bar position (smooth)
+let lastBarIdx = 0          // last integer bar the trails saw
 
 let breadthSeries = null     // Float32Array: per-day breadth in [-1, +1]
 let windField = null         // { points, positions, colors, velocities }
@@ -447,6 +456,106 @@ function updateWind(c, dt) {
   windField.geom.attributes.color.needsUpdate = true
 }
 
+// Continuous water surface: plane whose vertex heights are a gaussian-weighted
+// sum of every node's current XYZ, computed on the GPU every frame.
+function buildBlanket() {
+  disposeBlanket()
+  const geom = new THREE.PlaneGeometry(
+    BLANKET_SIZE, BLANKET_SIZE, BLANKET_SEGMENTS, BLANKET_SEGMENTS
+  )
+  geom.rotateX(-Math.PI / 2)
+
+  const nodeVecs = []
+  for (let i = 0; i < NODE_COUNT; i++) nodeVecs.push(new THREE.Vector3())
+  const uniforms = {
+    uNodes:   { value: nodeVecs },
+    uSigma:   { value: BLANKET_SIGMA },
+    uYScale:  { value: BLANKET_Y_SCALE },
+    uTime:    { value: 0 },
+  }
+
+  const mat = new THREE.ShaderMaterial({
+    uniforms,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    side: THREE.DoubleSide,
+    vertexShader: /* glsl */`
+      uniform vec3 uNodes[${NODE_COUNT}];
+      uniform float uSigma;
+      uniform float uYScale;
+      varying float vHeight;
+      varying vec3 vWorld;
+
+      void main() {
+        float y = 0.0;
+        float wsum = 0.0;
+        float inv2s2 = 1.0 / (2.0 * uSigma * uSigma);
+        for (int i = 0; i < ${NODE_COUNT}; i++) {
+          vec3 n = uNodes[i];
+          float dx = position.x - n.x;
+          float dz = position.z - n.z;
+          float d2 = dx * dx + dz * dz;
+          float w = exp(-d2 * inv2s2);
+          y += n.y * w;
+          wsum += w;
+        }
+        y = (wsum > 0.0001) ? (y / wsum) * uYScale : 0.0;
+        vHeight = y;
+        vec3 p = vec3(position.x, y, position.z);
+        vWorld = p;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      varying float vHeight;
+      varying vec3 vWorld;
+      uniform float uTime;
+
+      void main() {
+        // Map height to a deep-ocean -> crest gradient.
+        float t = clamp((vHeight + 6.0) / 12.0, 0.0, 1.0);
+        vec3 trough = vec3(0.02, 0.10, 0.22);
+        vec3 crest  = vec3(0.45, 0.85, 1.00);
+        vec3 col = mix(trough, crest, t);
+
+        // Subtle caustic-like bands so the surface reads as liquid.
+        float bands = 0.06 * sin(vWorld.x * 0.18 + uTime * 0.6)
+                     * cos(vWorld.z * 0.18 - uTime * 0.5);
+        col += bands;
+
+        // Edge fade so the plane blends into the void at its border.
+        float r = length(vec2(vWorld.x, vWorld.z));
+        float edge = smoothstep(${(BLANKET_SIZE / 2.4).toFixed(1)}, ${(BLANKET_SIZE / 2).toFixed(1)}, r);
+        float alpha = mix(0.38, 0.0, edge);
+
+        gl_FragColor = vec4(col, alpha);
+      }
+    `,
+  })
+  const mesh = new THREE.Mesh(geom, mat)
+  scene.add(mesh)
+  blanket = { mesh, uniforms, nodeVecs }
+}
+
+function disposeBlanket() {
+  if (!blanket) return
+  scene.remove(blanket.mesh)
+  blanket.mesh.geometry.dispose()
+  blanket.mesh.material.dispose()
+  blanket = null
+}
+
+function updateBlanket(elapsed) {
+  if (!blanket) return
+  const vecs = blanket.nodeVecs
+  for (let i = 0; i < nodes.length && i < NODE_COUNT; i++) {
+    const n = nodes[i]
+    vecs[i].set(n.x, n.mesh.position.y, n.z)
+  }
+  blanket.uniforms.uTime.value = elapsed
+}
+
 function buildEvents(eventsJson, dates) {
   const dateIndex = new Map(dates.map((d, i) => [d, i]))
   events = []
@@ -515,33 +624,53 @@ function easeLayout() {
   }
 }
 
-function applyCursor(c) {
-  for (const n of nodes) {
-    const y = n.normSeries[c] * Y_SCALE
-    n.mesh.position.y = y
+function sampleY(series, cf) {
+  const n = series.length
+  if (n === 0) return 0
+  let c = Math.floor(cf)
+  if (c < 0) c = 0
+  if (c >= n) c = n - 1
+  const next = Math.min(c + 1, n - 1)
+  const frac = cf - c
+  return series[c] + (series[next] - series[c]) * frac
+}
 
+// Per-frame tick: smoothly advances each node's Y with fractional-bar
+// interpolation and shifts the trail one slot every time we cross an
+// integer bar. Between crossings the trail's leading vertex tracks the
+// interpolated Y so the wave tip never jitters.
+function applySmoothCursor() {
+  const cf = cursorF
+  const c = Math.floor(cf)
+  const crossed = c !== lastBarIdx
+  for (const n of nodes) {
+    const y = sampleY(n.normSeries, cf) * Y_SCALE
+    n.mesh.position.y = y
     const p = n.trailPositions
-    p.copyWithin(0, 3)
     const last = (TRAIL_LEN - 1) * 3
+    if (crossed) {
+      p.copyWithin(0, 3)
+    }
     p[last] = n.x
     p[last + 1] = y
     p[last + 2] = n.z
     n.trailGeom.attributes.position.needsUpdate = true
   }
-  updateEvents(c)
-}
-
-function updateCursor(delta) {
-  cursor.value = (cursor.value + delta) % totalDays.value
-  if (cursor.value < 0) cursor.value += totalDays.value
-  applyCursor(cursor.value)
+  if (crossed) {
+    lastBarIdx = c
+    cursor.value = c
+    updateEvents(c)
+  }
 }
 
 // Jumping (scrub) rebuilds the trail from the preceding TRAIL_LEN bars so
 // the wave shape looks correct immediately rather than animating in.
 function jumpCursor(next) {
-  cursor.value = Math.max(0, Math.min(totalDays.value - 1, next))
-  const c = cursor.value
+  const clamped = Math.max(0, Math.min(totalDays.value - 1, next))
+  cursor.value = clamped
+  cursorF = clamped
+  lastBarIdx = clamped
+  const c = clamped
   for (const n of nodes) {
     const y = n.normSeries[c] * Y_SCALE
     n.mesh.position.y = y
@@ -565,18 +694,19 @@ function animate(t) {
   lastT = t
 
   easeLayout()
+
+  if (playing.value && totalDays.value > 0) {
+    cursorF += dt * playSpeed.value
+    // wrap
+    const total = totalDays.value
+    if (cursorF >= total) cursorF -= total
+    if (cursorF < 0) cursorF += total
+  }
+
+  if (loaded.value) applySmoothCursor()
+  updateBlanket(t * 0.001)
   updateWind(cursor.value, dt)
   if (predict.value) updateGhosts(cursor.value)
-
-  if (playing.value) {
-    animate._acc = (animate._acc ?? 0) + dt * playSpeed.value
-    while (animate._acc >= 1) {
-      updateCursor(1)
-      animate._acc -= 1
-    }
-  } else {
-    animate._acc = 0
-  }
 
   // Slow camera yaw for god's-eye feel
   const camR = 110
@@ -641,6 +771,7 @@ function clearScene() {
   events = []
   activeEvent.value = null
   disposeWindField()
+  disposeBlanket()
   breadthSeries = null
 }
 
@@ -664,10 +795,13 @@ async function loadData() {
       loadEvents(),
     ])
     buildScene(payload)
+    buildBlanket()
     buildWindField()
     buildEvents(eventsJson, payload.dates)
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
+    cursorF = 0
+    lastBarIdx = 0
     loaded.value = true
   } catch (e) {
     loadError.value = `Failed to load data: ${e.message}`
@@ -690,9 +824,11 @@ onMounted(async () => {
   camera.position.set(0, 55, 110)
   camera.lookAt(0, 0, 0)
 
-  // Subtle reference grid on the seafloor plane for scale.
-  const grid = new THREE.GridHelper(200, 20, 0x0a2340, 0x0a1628)
-  grid.position.y = -22
+  // Faint seafloor grid well below the water blanket for depth cues.
+  const grid = new THREE.GridHelper(240, 24, 0x06121d, 0x03080e)
+  grid.position.y = -34
+  grid.material.transparent = true
+  grid.material.opacity = 0.35
   scene.add(grid)
 
   handleResize()
