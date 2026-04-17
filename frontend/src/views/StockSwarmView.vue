@@ -10,6 +10,8 @@
         </span>
       </div>
     </div>
+    <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
+
     <div v-if="loadError" class="stock-swarm-error">{{ loadError }}</div>
 
     <div v-if="activeEvent" class="stock-swarm-event">
@@ -99,10 +101,12 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
-import { ar1Fit, correlationEmbedding, correlationMatrix, seriesStats } from '../utils/swarmMath.js'
+import { ar1Fit, correlationEmbedding, leadLagMatrix, seriesStats } from '../utils/swarmMath.js'
+import { Delaunay } from 'd3-delaunay'
 
 const canvasRef = ref(null)
 const trackRef = ref(null)
+const labelLayerRef = ref(null)
 const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
@@ -238,6 +242,8 @@ const EVENT_WINDOW_DAYS = 18   // how many bars on each side of the event show r
 const RING_MAX_RADIUS = 12
 
 let blanket = null          // { mesh, uniforms, nodeVecs }
+let edgeMesh = null         // LineSegments connecting neighboring tickers
+let edgePairs = []          // Array<[nodeIdxA, nodeIdxB]>
 let cursorF = 0             // fractional bar position (smooth)
 let lastBarIdx = 0          // last integer bar the trails saw
 
@@ -287,8 +293,11 @@ function buildScene(payload) {
 
   // Compute correlation matrix once, then a 2D embedding via PCA.
   const symbols = payload.tickers.map(t => t.symbol)
-  const corr = correlationMatrix(symbols, payload.prices)
-  const embedding = correlationEmbedding(corr, LAYOUT_SPAN)
+  // Lead-lag similarity: for each pair we keep the max-|corr| over ±5-day
+  // shifts, sign preserved. Nodes that lead, follow, or inversely follow
+  // each other all end up near each other; strength governs distance.
+  const simMatrix = leadLagMatrix(symbols, payload.prices, 5)
+  const embedding = correlationEmbedding(simMatrix, LAYOUT_SPAN)
 
   // Market breadth per day: 2 * fraction-positive - 1, in [-1, +1].
   breadthSeries = computeBreadth(symbols, payload.prices, payload.dates.length)
@@ -478,8 +487,9 @@ function buildBlanket() {
     uniforms,
     transparent: true,
     depthWrite: false,
-    blending: THREE.AdditiveBlending,
+    blending: THREE.NormalBlending,
     side: THREE.DoubleSide,
+    extensions: { derivatives: true },
     vertexShader: /* glsl */`
       uniform vec3 uNodes[${NODE_COUNT}];
       uniform float uSigma;
@@ -512,22 +522,37 @@ function buildBlanket() {
       varying vec3 vWorld;
       uniform float uTime;
 
+      // Antialiased grid intensity — returns >0 near integer grid lines.
+      float gridLine(vec2 p, float spacing, float thickness) {
+        vec2 g = abs(fract(p / spacing - 0.5) - 0.5) / fwidth(p / spacing);
+        float line = min(g.x, g.y);
+        return 1.0 - smoothstep(thickness, thickness + 1.0, line);
+      }
+
       void main() {
-        // Map height to a deep-ocean -> crest gradient.
+        // Deep-ocean base so the surface reads as a discrete plane.
         float t = clamp((vHeight + 6.0) / 12.0, 0.0, 1.0);
-        vec3 trough = vec3(0.02, 0.10, 0.22);
-        vec3 crest  = vec3(0.45, 0.85, 1.00);
+        vec3 trough = vec3(0.03, 0.09, 0.17);
+        vec3 crest  = vec3(0.55, 0.90, 1.00);
         vec3 col = mix(trough, crest, t);
 
-        // Subtle caustic-like bands so the surface reads as liquid.
-        float bands = 0.06 * sin(vWorld.x * 0.18 + uTime * 0.6)
-                     * cos(vWorld.z * 0.18 - uTime * 0.5);
+        // Grid lines every 10 world units, slightly brighter on crests.
+        float grid = gridLine(vWorld.xz, 10.0, 0.5);
+        col += vec3(0.35, 0.55, 0.70) * grid * (0.35 + 0.25 * t);
+
+        // White foam ridge on peaks so you can clearly track the crest.
+        float foam = smoothstep(0.55, 1.0, t);
+        col = mix(col, vec3(0.92, 0.98, 1.0), foam * 0.35);
+
+        // Soft caustic-like modulation (small) to suggest liquid movement.
+        float bands = 0.035 * sin(vWorld.x * 0.14 + uTime * 0.5)
+                     * cos(vWorld.z * 0.14 - uTime * 0.4);
         col += bands;
 
-        // Edge fade so the plane blends into the void at its border.
+        // Edge fade so the plane dissolves at its border.
         float r = length(vec2(vWorld.x, vWorld.z));
         float edge = smoothstep(${(BLANKET_SIZE / 2.4).toFixed(1)}, ${(BLANKET_SIZE / 2).toFixed(1)}, r);
-        float alpha = mix(0.38, 0.0, edge);
+        float alpha = mix(0.68, 0.0, edge);
 
         gl_FragColor = vec4(col, alpha);
       }
@@ -554,6 +579,110 @@ function updateBlanket(elapsed) {
     vecs[i].set(n.x, n.mesh.position.y, n.z)
   }
   blanket.uniforms.uTime.value = elapsed
+}
+
+// Delaunay triangulation of the target-XZ positions gives each node its
+// natural planar neighbors — denser where nodes cluster, sparser at the
+// edges, and always providing 360° coverage around each node.
+function buildEdges() {
+  disposeEdges()
+  if (nodes.length < 3) return
+  const pts = new Float64Array(nodes.length * 2)
+  for (let i = 0; i < nodes.length; i++) {
+    pts[i * 2] = nodes[i].targetX
+    pts[i * 2 + 1] = nodes[i].targetZ
+  }
+  const delaunay = new Delaunay(pts)
+  const seen = new Set()
+  edgePairs = []
+  const tri = delaunay.triangles
+  for (let k = 0; k < tri.length; k += 3) {
+    const a = tri[k], b = tri[k + 1], c = tri[k + 2]
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const lo = Math.min(u, v), hi = Math.max(u, v)
+      const key = lo * 1024 + hi
+      if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
+    }
+  }
+
+  const positions = new Float32Array(edgePairs.length * 2 * 3)
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  const mat = new THREE.LineBasicMaterial({
+    color: 0x6fd6ff, transparent: true, opacity: 0.22, depthWrite: false,
+  })
+  edgeMesh = new THREE.LineSegments(geom, mat)
+  scene.add(edgeMesh)
+}
+
+function disposeEdges() {
+  if (!edgeMesh) return
+  scene.remove(edgeMesh)
+  edgeMesh.geometry.dispose()
+  edgeMesh.material.dispose()
+  edgeMesh = null
+  edgePairs = []
+}
+
+function updateEdges() {
+  if (!edgeMesh) return
+  const pos = edgeMesh.geometry.attributes.position.array
+  for (let i = 0; i < edgePairs.length; i++) {
+    const [a, b] = edgePairs[i]
+    const na = nodes[a], nb = nodes[b]
+    const o = i * 6
+    pos[o]     = na.x
+    pos[o + 1] = na.mesh.position.y
+    pos[o + 2] = na.z
+    pos[o + 3] = nb.x
+    pos[o + 4] = nb.mesh.position.y
+    pos[o + 5] = nb.z
+  }
+  edgeMesh.geometry.attributes.position.needsUpdate = true
+}
+
+// HTML ticker labels as a DOM overlay. We keep one div per node and
+// just update its `transform` every frame with the 3D-to-screen
+// projected position. Cheaper than recreating Vue nodes per frame.
+function buildLabels() {
+  disposeLabels()
+  const layer = labelLayerRef.value
+  if (!layer) return
+  for (const n of nodes) {
+    const el = document.createElement('div')
+    el.className = 'stock-swarm-label'
+    el.textContent = n.symbol
+    el.style.color = '#' + new THREE.Color(TIER_COLORS[n.tier] ?? 0xffffff).getHexString()
+    layer.appendChild(el)
+    n.labelEl = el
+  }
+}
+
+function disposeLabels() {
+  for (const n of nodes) {
+    if (n.labelEl) { n.labelEl.remove(); n.labelEl = null }
+  }
+  if (labelLayerRef.value) labelLayerRef.value.innerHTML = ''
+}
+
+const tmpVec = new THREE.Vector3()
+function updateLabels() {
+  const canvas = renderer?.domElement
+  if (!canvas) return
+  const w = canvas.clientWidth
+  const h = canvas.clientHeight
+  for (const n of nodes) {
+    if (!n.labelEl) continue
+    tmpVec.set(n.x, n.mesh.position.y + 2.2, n.z).project(camera)
+    // project returns NDC in [-1, 1]; also z > 1 means behind camera.
+    if (tmpVec.z > 1) { n.labelEl.style.opacity = '0'; continue }
+    const x = (tmpVec.x * 0.5 + 0.5) * w
+    const y = (-tmpVec.y * 0.5 + 0.5) * h
+    n.labelEl.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -100%)`
+    // Fade with distance so labels don't overwhelm when the camera is far.
+    const depth = Math.min(1, Math.max(0, 1.2 - tmpVec.z))
+    n.labelEl.style.opacity = depth.toFixed(3)
+  }
 }
 
 function buildEvents(eventsJson, dates) {
@@ -704,9 +833,11 @@ function animate(t) {
   }
 
   if (loaded.value) applySmoothCursor()
+  updateEdges()
   updateBlanket(t * 0.001)
   updateWind(cursor.value, dt)
   if (predict.value) updateGhosts(cursor.value)
+  if (loaded.value) updateLabels()
 
   // Slow camera yaw for god's-eye feel
   const camR = 110
@@ -772,6 +903,8 @@ function clearScene() {
   activeEvent.value = null
   disposeWindField()
   disposeBlanket()
+  disposeEdges()
+  disposeLabels()
   breadthSeries = null
 }
 
@@ -795,9 +928,11 @@ async function loadData() {
       loadEvents(),
     ])
     buildScene(payload)
+    buildEdges()
     buildBlanket()
     buildWindField()
     buildEvents(eventsJson, payload.dates)
+    buildLabels()
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
     cursorF = 0
@@ -881,6 +1016,29 @@ onBeforeUnmount(() => {
   font-size: 11px;
   opacity: 0.7;
   margin-top: 2px;
+}
+.stock-swarm-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.stock-swarm-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 1px 4px;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 2px;
+  white-space: nowrap;
+  transform: translate(-9999px, -9999px);
+  pointer-events: none;
+  will-change: transform, opacity;
+  text-shadow: 0 0 6px rgba(0, 0, 0, 0.85);
 }
 .stock-swarm-error {
   position: absolute;
