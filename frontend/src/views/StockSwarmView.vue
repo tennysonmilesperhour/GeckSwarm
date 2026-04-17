@@ -116,7 +116,9 @@ const tickerCount = ref(0)
 const datesRef = ref([])
 const playing = ref(true)
 const playSpeed = ref(1.2)
-const source = ref('stub')
+// Auto-select "real" when a backend is configured at build time.
+const defaultSource = (import.meta.env.VITE_API_BASE_URL || '').trim() ? 'real' : 'stub'
+const source = ref(defaultSource)
 const sourceLabel = ref('')
 const activeEvent = ref(null)
 const wind = ref(0)   // smoothed breadth in [-1, +1]
@@ -312,7 +314,7 @@ function buildScene(payload) {
     const normSeries = normalizeZScore(payload.prices[t.symbol])
     const color = TIER_COLORS[t.tier] ?? 0xffffff
     // Tier scales node size: mega-caps and anchors read as "larger waves".
-    const size = 1.4 - Math.min(0.8, (t.tier - 1) * 0.06)
+    const size = 1.3 - Math.min(0.7, (t.tier - 1) * 0.05)
 
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(size, 16, 12),
@@ -409,60 +411,15 @@ function computeBreadth(symbols, prices, days) {
   return out
 }
 
-function buildWindField() {
-  disposeWindField()
-  const positions = new Float32Array(WIND_PARTICLES * 3)
-  const colors = new Float32Array(WIND_PARTICLES * 3)
-  const velocities = new Float32Array(WIND_PARTICLES)
-  for (let i = 0; i < WIND_PARTICLES; i++) {
-    positions[i * 3]     = (Math.random() * 2 - 1) * WIND_BOUNDS
-    positions[i * 3 + 1] = WIND_Y_MIN + Math.random() * (WIND_Y_MAX - WIND_Y_MIN)
-    positions[i * 3 + 2] = (Math.random() * 2 - 1) * WIND_BOUNDS
-    velocities[i] = 0.6 + Math.random() * 0.8
-  }
-  const geom = new THREE.BufferGeometry()
-  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
-  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-  const mat = new THREE.PointsMaterial({
-    size: 0.9, vertexColors: true, transparent: true, opacity: 0.7, depthWrite: false,
-  })
-  const points = new THREE.Points(geom, mat)
-  scene.add(points)
-  windField = { points, positions, colors, velocities, geom, mat }
-}
+// Wind particle field removed — the top HUD already shows breadth;
+// particles floating over the scene were visual noise against black.
+function buildWindField() {}
+function disposeWindField() {}
 
-function disposeWindField() {
-  if (!windField) return
-  scene.remove(windField.points)
-  windField.geom.dispose()
-  windField.mat.dispose()
-  windField = null
-}
-
-function updateWind(c, dt) {
-  if (!breadthSeries || !windField) return
+function updateWind(c) {
+  if (!breadthSeries) return
   const raw = breadthSeries[c] ?? 0
-  // One more pass of smoothing against the reactive value so the HUD also eases.
   wind.value = wind.value * 0.9 + raw * 0.1
-  const w = wind.value
-  const speedScale = 22  // units per second at |w|=1
-  const { positions, colors, velocities } = windField
-  const gR = w < 0 ? 1 : (1 - w) * 0.3 + 0.1
-  const gG = w > 0 ? 1 : (1 + w) * 0.3 + 0.1
-  const gB = 0.25
-  for (let i = 0; i < WIND_PARTICLES; i++) {
-    const dx = w * velocities[i] * speedScale * dt
-    let nx = positions[i * 3] + dx
-    if (nx > WIND_BOUNDS) nx -= WIND_BOUNDS * 2
-    else if (nx < -WIND_BOUNDS) nx += WIND_BOUNDS * 2
-    positions[i * 3] = nx
-
-    colors[i * 3]     = gR
-    colors[i * 3 + 1] = gG
-    colors[i * 3 + 2] = gB
-  }
-  windField.geom.attributes.position.needsUpdate = true
-  windField.geom.attributes.color.needsUpdate = true
 }
 
 // Continuous water surface: plane whose vertex heights are a gaussian-weighted
@@ -522,25 +479,25 @@ function buildBlanket() {
       uniform float uTime;
 
       void main() {
-        // Deep-ocean base so the surface reads as a discrete plane.
+        // Heat map: crests are bullish amber, midline is near-black void,
+        // troughs are bearish crimson-magenta. The surface is a visible
+        // record of where money is pushing and where it is retreating.
         float t = clamp((vHeight + 6.0) / 12.0, 0.0, 1.0);
-        vec3 trough = vec3(0.03, 0.09, 0.17);
-        vec3 crest  = vec3(0.55, 0.90, 1.00);
-        vec3 col = mix(trough, crest, t);
+        vec3 deep = vec3(0.28, 0.03, 0.09);   // trough - crimson
+        vec3 calm = vec3(0.02, 0.02, 0.05);   // zero - near black
+        vec3 peak = vec3(1.00, 0.70, 0.20);   // crest - amber gold
+        vec3 col = (t < 0.5)
+          ? mix(deep, calm, smoothstep(0.0, 0.5, t))
+          : mix(calm, peak, smoothstep(0.5, 1.0, t));
 
-        // White foam ridge on peaks so you can clearly track the crest.
-        float foam = smoothstep(0.55, 1.0, t);
-        col = mix(col, vec3(0.92, 0.98, 1.0), foam * 0.4);
-
-        // Soft caustic-like modulation (small) to suggest liquid movement.
-        float bands = 0.035 * sin(vWorld.x * 0.14 + uTime * 0.5)
-                     * cos(vWorld.z * 0.14 - uTime * 0.4);
-        col += bands;
+        // Slightly boost the crest glow so peaks read as hot/luminous.
+        float glow = smoothstep(0.7, 1.0, t);
+        col += vec3(0.35, 0.20, 0.06) * glow;
 
         // Edge fade so the plane dissolves at its border.
         float r = length(vec2(vWorld.x, vWorld.z));
         float edge = smoothstep(${(BLANKET_SIZE / 2.4).toFixed(1)}, ${(BLANKET_SIZE / 2).toFixed(1)}, r);
-        float alpha = mix(0.55, 0.0, edge);
+        float alpha = mix(0.42, 0.0, edge);
 
         gl_FragColor = vec4(col, alpha);
       }
@@ -597,7 +554,7 @@ function buildEdges() {
   const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   const mat = new THREE.LineBasicMaterial({
-    color: 0xa8e4ff, transparent: true, opacity: 0.55, depthWrite: false,
+    color: 0xffffff, transparent: true, opacity: 0.28, depthWrite: false,
   })
   edgeMesh = new THREE.LineSegments(geom, mat)
   scene.add(edgeMesh)
@@ -638,21 +595,29 @@ function buildLabels() {
   if (!layer) return
   for (const n of nodes) {
     const el = document.createElement('div')
-    el.className = 'stock-swarm-label'
-    el.textContent = n.symbol
-    // Glow halo = tier color, text stays white for legibility.
+    el.className = 'ss-label'
     el.style.setProperty(
-      '--glow',
+      '--tier',
       '#' + new THREE.Color(TIER_COLORS[n.tier] ?? 0xffffff).getHexString()
     )
+    const sym = document.createElement('div')
+    sym.className = 'ss-label-sym'
+    sym.textContent = n.symbol
+    const price = document.createElement('div')
+    price.className = 'ss-label-price'
+    price.textContent = ''
+    el.appendChild(sym)
+    el.appendChild(price)
     layer.appendChild(el)
     n.labelEl = el
+    n.labelPriceEl = price
+    n.labelPrevPrice = null
   }
 }
 
 function disposeLabels() {
   for (const n of nodes) {
-    if (n.labelEl) { n.labelEl.remove(); n.labelEl = null }
+    if (n.labelEl) { n.labelEl.remove(); n.labelEl = null; n.labelPriceEl = null }
   }
   if (labelLayerRef.value) labelLayerRef.value.innerHTML = ''
 }
@@ -663,17 +628,29 @@ function updateLabels() {
   if (!canvas) return
   const w = canvas.clientWidth
   const h = canvas.clientHeight
+  const cIdx = Math.floor(cursorF)
+  const cSafe = Math.max(0, Math.min(totalDays.value - 1, cIdx))
   for (const n of nodes) {
     if (!n.labelEl) continue
-    tmpVec.set(n.x, n.mesh.position.y + 1.6, n.z).project(camera)
-    // project returns NDC in [-1, 1]; also z > 1 means behind camera.
+    tmpVec.set(n.x, n.mesh.position.y, n.z).project(camera)
     if (tmpVec.z > 1) { n.labelEl.style.opacity = '0'; continue }
     const x = (tmpVec.x * 0.5 + 0.5) * w
     const y = (-tmpVec.y * 0.5 + 0.5) * h
-    n.labelEl.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -100%)`
-    // Fade with distance so labels don't overwhelm when the camera is far.
-    const depth = Math.min(1, Math.max(0, 1.2 - tmpVec.z))
-    n.labelEl.style.opacity = depth.toFixed(3)
+    // Labels anchored to the right of the node sphere and vertically centered,
+    // so they ride the wave up and down with the node.
+    n.labelEl.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(9px, -50%)`
+    n.labelEl.style.opacity = '1'
+
+    // Price: color + arrow based on direction since the previous rendered bar.
+    const price = n.rawPrices[cSafe]
+    const txt = price >= 1000 ? price.toFixed(0) : price.toFixed(2)
+    const prev = n.labelPrevPrice
+    if (prev !== null) {
+      const up = price > prev
+      n.labelPriceEl.dataset.dir = price === prev ? 'flat' : (up ? 'up' : 'down')
+    }
+    n.labelPriceEl.textContent = txt
+    n.labelPrevPrice = price
   }
 }
 
@@ -827,7 +804,7 @@ function animate(t) {
   if (loaded.value) applySmoothCursor()
   updateEdges()
   updateBlanket(t * 0.001)
-  updateWind(cursor.value, dt)
+  updateWind(cursor.value)
   if (predict.value) updateGhosts(cursor.value)
   if (loaded.value) updateLabels()
 
@@ -857,7 +834,8 @@ async function fetchReal() {
   let reason = null
   let payload = null
   try {
-    const res = await fetch('/api/stock-swarm/prices?period=2y')
+    const apiBase = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '')
+    const res = await fetch(`${apiBase}/api/stock-swarm/prices?period=2y`)
     if (!res.ok) {
       reason = `api_http_${res.status}`
     } else {
@@ -943,20 +921,13 @@ onMounted(async () => {
   const canvas = canvasRef.value
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
-  renderer.setClearColor(0x05080f, 1)
+  renderer.setClearColor(0x000000, 1)
 
   scene = new THREE.Scene()
-  scene.fog = new THREE.Fog(0x05080f, 120, 260)
-  camera = new THREE.PerspectiveCamera(55, 1, 0.1, 2000)
-  camera.position.set(0, 55, 110)
+  scene.fog = new THREE.Fog(0x000000, 140, 260)
+  camera = new THREE.PerspectiveCamera(52, 1, 0.1, 2000)
+  camera.position.set(0, 52, 115)
   camera.lookAt(0, 0, 0)
-
-  // Faint seafloor grid well below the water blanket for depth cues.
-  const grid = new THREE.GridHelper(240, 24, 0x06121d, 0x03080e)
-  grid.position.y = -34
-  grid.material.transparent = true
-  grid.material.opacity = 0.35
-  scene.add(grid)
 
   handleResize()
   resizeObserver = new ResizeObserver(handleResize)
@@ -981,7 +952,7 @@ onBeforeUnmount(() => {
 .stock-swarm-root {
   position: fixed;
   inset: 0;
-  background: #05080f;
+  background: #000;
   overflow: hidden;
 }
 .stock-swarm-canvas {
@@ -1015,26 +986,42 @@ onBeforeUnmount(() => {
   pointer-events: none;
   overflow: hidden;
 }
-.stock-swarm-label {
+.ss-label {
   position: absolute;
   top: 0;
   left: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.08em;
-  line-height: 1;
-  color: #fff;
+  line-height: 1.1;
   white-space: nowrap;
   transform: translate(-9999px, -9999px);
   pointer-events: none;
-  will-change: transform, opacity;
-  text-shadow:
-    0 0 2px rgba(0, 0, 0, 0.95),
-    0 0 4px rgba(0, 0, 0, 0.85),
-    0 0 8px var(--glow, #6fd6ff),
-    0 0 14px var(--glow, #6fd6ff);
+  will-change: transform;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
 }
+.ss-label-sym {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.10em;
+  color: #fff;
+  text-shadow:
+    0 0 2px #000,
+    0 0 5px #000,
+    0 0 10px var(--tier, #6fd6ff);
+}
+.ss-label-price {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #d9e8f0;
+  opacity: 0.78;
+  text-shadow: 0 0 3px #000, 0 0 6px #000;
+}
+.ss-label-price[data-dir="up"]   { color: #6fffb2; }
+.ss-label-price[data-dir="down"] { color: #ff6f80; }
+.ss-label-price[data-dir="flat"] { color: #d9e8f0; }
 .stock-swarm-error {
   position: absolute;
   bottom: 20px;
