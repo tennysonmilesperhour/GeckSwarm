@@ -489,7 +489,6 @@ function buildBlanket() {
     depthWrite: false,
     blending: THREE.NormalBlending,
     side: THREE.DoubleSide,
-    extensions: { derivatives: true },
     vertexShader: /* glsl */`
       uniform vec3 uNodes[${NODE_COUNT}];
       uniform float uSigma;
@@ -522,13 +521,6 @@ function buildBlanket() {
       varying vec3 vWorld;
       uniform float uTime;
 
-      // Antialiased grid intensity — returns >0 near integer grid lines.
-      float gridLine(vec2 p, float spacing, float thickness) {
-        vec2 g = abs(fract(p / spacing - 0.5) - 0.5) / fwidth(p / spacing);
-        float line = min(g.x, g.y);
-        return 1.0 - smoothstep(thickness, thickness + 1.0, line);
-      }
-
       void main() {
         // Deep-ocean base so the surface reads as a discrete plane.
         float t = clamp((vHeight + 6.0) / 12.0, 0.0, 1.0);
@@ -536,13 +528,9 @@ function buildBlanket() {
         vec3 crest  = vec3(0.55, 0.90, 1.00);
         vec3 col = mix(trough, crest, t);
 
-        // Grid lines every 10 world units, slightly brighter on crests.
-        float grid = gridLine(vWorld.xz, 10.0, 0.5);
-        col += vec3(0.35, 0.55, 0.70) * grid * (0.35 + 0.25 * t);
-
         // White foam ridge on peaks so you can clearly track the crest.
         float foam = smoothstep(0.55, 1.0, t);
-        col = mix(col, vec3(0.92, 0.98, 1.0), foam * 0.35);
+        col = mix(col, vec3(0.92, 0.98, 1.0), foam * 0.4);
 
         // Soft caustic-like modulation (small) to suggest liquid movement.
         float bands = 0.035 * sin(vWorld.x * 0.14 + uTime * 0.5)
@@ -552,7 +540,7 @@ function buildBlanket() {
         // Edge fade so the plane dissolves at its border.
         float r = length(vec2(vWorld.x, vWorld.z));
         float edge = smoothstep(${(BLANKET_SIZE / 2.4).toFixed(1)}, ${(BLANKET_SIZE / 2).toFixed(1)}, r);
-        float alpha = mix(0.68, 0.0, edge);
+        float alpha = mix(0.55, 0.0, edge);
 
         gl_FragColor = vec4(col, alpha);
       }
@@ -609,7 +597,7 @@ function buildEdges() {
   const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   const mat = new THREE.LineBasicMaterial({
-    color: 0x6fd6ff, transparent: true, opacity: 0.22, depthWrite: false,
+    color: 0xa8e4ff, transparent: true, opacity: 0.55, depthWrite: false,
   })
   edgeMesh = new THREE.LineSegments(geom, mat)
   scene.add(edgeMesh)
@@ -652,7 +640,11 @@ function buildLabels() {
     const el = document.createElement('div')
     el.className = 'stock-swarm-label'
     el.textContent = n.symbol
-    el.style.color = '#' + new THREE.Color(TIER_COLORS[n.tier] ?? 0xffffff).getHexString()
+    // Glow halo = tier color, text stays white for legibility.
+    el.style.setProperty(
+      '--glow',
+      '#' + new THREE.Color(TIER_COLORS[n.tier] ?? 0xffffff).getHexString()
+    )
     layer.appendChild(el)
     n.labelEl = el
   }
@@ -673,7 +665,7 @@ function updateLabels() {
   const h = canvas.clientHeight
   for (const n of nodes) {
     if (!n.labelEl) continue
-    tmpVec.set(n.x, n.mesh.position.y + 2.2, n.z).project(camera)
+    tmpVec.set(n.x, n.mesh.position.y + 1.6, n.z).project(camera)
     // project returns NDC in [-1, 1]; also z > 1 means behind camera.
     if (tmpVec.z > 1) { n.labelEl.style.opacity = '0'; continue }
     const x = (tmpVec.x * 0.5 + 0.5) * w
@@ -1029,16 +1021,19 @@ onBeforeUnmount(() => {
   left: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  padding: 1px 4px;
-  background: rgba(0, 0, 0, 0.55);
-  border-radius: 2px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  color: #fff;
   white-space: nowrap;
   transform: translate(-9999px, -9999px);
   pointer-events: none;
   will-change: transform, opacity;
-  text-shadow: 0 0 6px rgba(0, 0, 0, 0.85);
+  text-shadow:
+    0 0 2px rgba(0, 0, 0, 0.95),
+    0 0 4px rgba(0, 0, 0, 0.85),
+    0 0 8px var(--glow, #6fd6ff),
+    0 0 14px var(--glow, #6fd6ff);
 }
 .stock-swarm-error {
   position: absolute;
