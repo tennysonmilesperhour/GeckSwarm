@@ -12,6 +12,12 @@
     </div>
     <div v-if="loadError" class="stock-swarm-error">{{ loadError }}</div>
 
+    <div v-if="activeEvent" class="stock-swarm-event">
+      <span class="evt-dot" :style="{ background: activeEvent.color }" />
+      <span class="evt-date">{{ activeEvent.date }}</span>
+      <span class="evt-label">{{ activeEvent.label }}</span>
+    </div>
+
     <div class="stock-swarm-source">
       <label>
         <input type="radio" value="stub" v-model="source" @change="reload" />
@@ -66,6 +72,7 @@ const playing = ref(true)
 const playSpeed = ref(1.2)
 const source = ref('stub')
 const sourceLabel = ref('')
+const activeEvent = ref(null)
 
 const currentDate = computed(() => datesRef.value[cursor.value] ?? '')
 
@@ -100,6 +107,10 @@ let rafId = null
 let resizeObserver = null
 let lastT = 0
 let nodes = []       // { symbol, tier, mesh, trail, trailPositions, normSeries, x, z, targetX, targetZ }
+let nodeBySymbol = new Map()
+let events = []      // [{ date, dayIndex, label, color, magnitude, tickers, rings: [Mesh] }]
+const EVENT_WINDOW_DAYS = 18   // how many bars on each side of the event show rings
+const RING_MAX_RADIUS = 12
 
 function handleResize() {
   if (!renderer || !camera || !canvasRef.value) return
@@ -174,13 +185,74 @@ function buildScene(payload) {
     const trail = new THREE.Line(trailGeom, trailMat)
     scene.add(trail)
 
-    nodes.push({
+    const node = {
       symbol: t.symbol, tier: t.tier, mesh, trail, trailGeom,
       trailPositions, normSeries,
       x: gridX, z: gridZ,
       targetX, targetZ,
-    })
+    }
+    nodes.push(node)
+    nodeBySymbol.set(t.symbol, node)
   })
+}
+
+function buildEvents(eventsJson, dates) {
+  const dateIndex = new Map(dates.map((d, i) => [d, i]))
+  events = []
+  for (const ev of eventsJson.events || []) {
+    const dayIndex = dateIndex.get(ev.date)
+    if (dayIndex === undefined) continue
+    const color = new THREE.Color(ev.color || '#6fd6ff')
+    const rings = []
+    for (const sym of ev.tickers) {
+      const node = nodeBySymbol.get(sym)
+      if (!node) continue
+      const geom = new THREE.RingGeometry(0.1, 0.18, 48)
+      const mat = new THREE.MeshBasicMaterial({
+        color, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false,
+      })
+      const mesh = new THREE.Mesh(geom, mat)
+      mesh.rotation.x = -Math.PI / 2
+      mesh.visible = false
+      scene.add(mesh)
+      rings.push({ mesh, node })
+    }
+    events.push({
+      date: ev.date, dayIndex,
+      label: ev.label,
+      color: ev.color || '#6fd6ff',
+      magnitude: ev.magnitude ?? 0.7,
+      rings,
+    })
+  }
+}
+
+function updateEvents(c) {
+  let nearest = null
+  let nearestDist = Infinity
+  for (const ev of events) {
+    const dist = c - ev.dayIndex
+    const ad = Math.abs(dist)
+    if (ad < nearestDist) { nearestDist = ad; nearest = ev }
+    const visible = ad <= EVENT_WINDOW_DAYS
+    for (const { mesh, node } of ev.rings) {
+      mesh.visible = visible
+      if (!visible) continue
+      // Rings are born at the event date and expand outward after it; before
+      // it, they pulse inward (a "premonition" shimmer). Works either way.
+      const t = dist / EVENT_WINDOW_DAYS // [-1..1]
+      const phase = Math.max(0, Math.min(1, Math.abs(t)))
+      const radius = 0.4 + phase * RING_MAX_RADIUS * ev.magnitude
+      const thickness = 0.15 + (1 - phase) * 0.5
+      mesh.geometry.dispose()
+      mesh.geometry = new THREE.RingGeometry(radius, radius + thickness, 64)
+      mesh.material.opacity = (1 - phase) * 0.9 * ev.magnitude
+      mesh.position.set(node.x, node.mesh.position.y, node.z)
+    }
+  }
+  activeEvent.value = (nearest && nearestDist <= EVENT_WINDOW_DAYS) ? {
+    date: nearest.date, label: nearest.label, color: nearest.color,
+  } : null
 }
 
 function easeLayout() {
@@ -205,6 +277,7 @@ function applyCursor(c) {
     p[last + 2] = n.z
     n.trailGeom.attributes.position.needsUpdate = true
   }
+  updateEvents(c)
 }
 
 function updateCursor(delta) {
@@ -231,6 +304,7 @@ function jumpCursor(next) {
     }
     n.trailGeom.attributes.position.needsUpdate = true
   }
+  updateEvents(c)
 }
 
 function animate(t) {
@@ -292,6 +366,25 @@ function clearScene() {
     n.trailGeom.dispose(); n.trail.material.dispose()
   }
   nodes = []
+  nodeBySymbol = new Map()
+  for (const ev of events) {
+    for (const { mesh } of ev.rings) {
+      scene.remove(mesh)
+      mesh.geometry.dispose(); mesh.material.dispose()
+    }
+  }
+  events = []
+  activeEvent.value = null
+}
+
+async function loadEvents() {
+  try {
+    const res = await fetch('/stock-swarm/events.json', { cache: 'force-cache' })
+    if (!res.ok) return { events: [] }
+    return await res.json()
+  } catch {
+    return { events: [] }
+  }
 }
 
 async function loadData() {
@@ -299,8 +392,12 @@ async function loadData() {
     loaded.value = false
     loadError.value = ''
     clearScene()
-    const payload = source.value === 'real' ? await fetchReal() : await fetchStub()
+    const [payload, eventsJson] = await Promise.all([
+      source.value === 'real' ? fetchReal() : fetchStub(),
+      loadEvents(),
+    ])
     buildScene(payload)
+    buildEvents(eventsJson, payload.dates)
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
     loaded.value = true
@@ -477,5 +574,38 @@ onBeforeUnmount(() => {
 .source-label {
   opacity: 0.6;
   font-size: 10px;
+}
+.stock-swarm-event {
+  position: absolute;
+  top: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  padding: 6px 12px;
+  background: rgba(5, 8, 15, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+.evt-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-shadow: 0 0 12px currentColor;
+}
+.evt-date {
+  opacity: 0.7;
+  font-size: 11px;
+}
+.evt-label {
+  color: #fff;
+  letter-spacing: 0.03em;
 }
 </style>

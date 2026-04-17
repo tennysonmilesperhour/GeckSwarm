@@ -1,0 +1,61 @@
+{
+  "description": "Historical market-moving events overlaid on the wave field. Dates outside the loaded price series are ignored.",
+  "events": [
+    {
+      "date": "2024-07-18",
+      "label": "CrowdStrike global IT outage",
+      "magnitude": 0.6,
+      "color": "#ffb86c",
+      "tickers": ["MSFT", "CRM", "NOW", "JPM", "BAC", "DAL", "UAL"]
+    },
+    {
+      "date": "2024-08-05",
+      "label": "Yen carry-trade unwind",
+      "magnitude": 0.8,
+      "color": "#ff79c6",
+      "tickers": ["QQQ", "SPY", "NVDA", "AAPL", "MSFT", "TSLA"]
+    },
+    {
+      "date": "2024-11-06",
+      "label": "US election outcome",
+      "magnitude": 0.9,
+      "color": "#50fa7b",
+      "tickers": ["SPY", "QQQ", "XLF", "JPM", "GS", "XOM", "TSLA"]
+    },
+    {
+      "date": "2025-01-27",
+      "label": "DeepSeek AI shock",
+      "magnitude": 1.0,
+      "color": "#ff5555",
+      "tickers": ["NVDA", "AMD", "AVGO", "ASML", "TSM", "MU", "MSFT"]
+    },
+    {
+      "date": "2025-04-02",
+      "label": "Tariff regime announcement",
+      "magnitude": 0.95,
+      "color": "#ffd166",
+      "tickers": ["SPY", "QQQ", "XOM", "CVX", "TSM", "AAPL", "NVDA", "WMT"]
+    },
+    {
+      "date": "2025-08-15",
+      "label": "Fed pivot / rate cut",
+      "magnitude": 0.7,
+      "color": "#6fd6ff",
+      "tickers": ["TLT", "XLF", "JPM", "BAC", "HD", "GLD"]
+    },
+    {
+      "date": "2025-12-10",
+      "label": "AI capex super-cycle peak",
+      "magnitude": 0.75,
+      "color": "#bd93f9",
+      "tickers": ["NVDA", "MSFT", "GOOGL", "AVGO", "ORCL", "NOW"]
+    },
+    {
+      "date": "2026-02-20",
+      "label": "Energy supply disruption",
+      "magnitude": 0.8,
+      "color": "#ff5555",
+      "tickers": ["XOM", "CVX", "COP", "SLB", "DAL", "UAL", "UPS", "FDX"]
+    }
+  ]
+}
