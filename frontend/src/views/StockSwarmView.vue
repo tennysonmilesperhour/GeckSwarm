@@ -41,6 +41,11 @@
         real (yfinance)
       </label>
       <span v-if="sourceLabel" class="source-label">{{ sourceLabel }}</span>
+      <span class="source-sep" />
+      <label title="Show AR(1) forecast ghost nodes (expected position {{ horizon }} bars ahead)">
+        <input type="checkbox" v-model="predict" @change="onPredictToggle" />
+        predict +{{ horizon }}d
+      </label>
     </div>
 
     <div v-if="loaded" class="stock-swarm-controls">
@@ -72,7 +77,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
-import { correlationEmbedding, correlationMatrix } from '../utils/swarmMath.js'
+import { ar1Fit, correlationEmbedding, correlationMatrix, seriesStats } from '../utils/swarmMath.js'
 
 const canvasRef = ref(null)
 const loaded = ref(false)
@@ -87,6 +92,8 @@ const source = ref('stub')
 const sourceLabel = ref('')
 const activeEvent = ref(null)
 const wind = ref(0)   // smoothed breadth in [-1, +1]
+const predict = ref(false)
+const horizon = ref(20)
 
 const windFillPct = computed(() => Math.min(100, Math.abs(wind.value) * 100))
 const windLabel = computed(() => (wind.value >= 0 ? '+' : '−') + Math.abs(wind.value).toFixed(2))
@@ -215,15 +222,62 @@ function buildScene(payload) {
     const trail = new THREE.Line(trailGeom, trailMat)
     scene.add(trail)
 
+    // AR(1) parameters on log-returns + price-series stats for z-scoring
+    // predicted prices with the same mean/std as the historical series.
+    const rawPrices = payload.prices[t.symbol]
+    const { phi, drift } = ar1Fit(rawPrices)
+    const { mean: priceMean, std: priceStd } = seriesStats(rawPrices)
+
+    // Ghost sphere (hidden unless `predict` is enabled).
+    const ghost = new THREE.Mesh(
+      new THREE.SphereGeometry(size * 0.85, 12, 8),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.32, depthWrite: false }),
+    )
+    ghost.visible = false
+    scene.add(ghost)
+
     const node = {
       symbol: t.symbol, tier: t.tier, mesh, trail, trailGeom,
-      trailPositions, normSeries,
+      trailPositions, normSeries, rawPrices,
+      phi, drift, priceMean, priceStd,
+      ghost,
       x: gridX, z: gridZ,
       targetX, targetZ,
     }
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
   })
+}
+
+function predictY(node, c, H) {
+  if (c < 1) return node.normSeries[c] * Y_SCALE
+  let r = Math.log(node.rawPrices[c] / node.rawPrices[c - 1])
+  let logSum = 0
+  for (let h = 0; h < H; h++) {
+    r = node.phi * r + node.drift
+    logSum += r
+  }
+  const predPrice = node.rawPrices[c] * Math.exp(logSum)
+  let z = (predPrice - node.priceMean) / node.priceStd
+  if (z > 3) z = 3; else if (z < -3) z = -3
+  return z * Y_SCALE
+}
+
+function updateGhosts(c) {
+  const visible = predict.value
+  const H = horizon.value
+  for (const n of nodes) {
+    if (!visible) {
+      if (n.ghost.visible) n.ghost.visible = false
+      continue
+    }
+    n.ghost.visible = true
+    n.ghost.position.set(n.x, predictY(n, c, H), n.z + 2.2)
+  }
+}
+
+function onPredictToggle() {
+  updateGhosts(cursor.value)
 }
 
 function computeBreadth(symbols, prices, days) {
@@ -419,6 +473,7 @@ function animate(t) {
 
   easeLayout()
   updateWind(cursor.value, dt)
+  if (predict.value) updateGhosts(cursor.value)
 
   if (playing.value) {
     animate._acc = (animate._acc ?? 0) + dt * playSpeed.value
@@ -466,9 +521,10 @@ async function fetchReal() {
 
 function clearScene() {
   for (const n of nodes) {
-    scene.remove(n.mesh); scene.remove(n.trail)
+    scene.remove(n.mesh); scene.remove(n.trail); scene.remove(n.ghost)
     n.mesh.geometry.dispose(); n.mesh.material.dispose()
     n.trailGeom.dispose(); n.trail.material.dispose()
+    n.ghost.geometry.dispose(); n.ghost.material.dispose()
   }
   nodes = []
   nodeBySymbol = new Map()
@@ -546,13 +602,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (rafId) cancelAnimationFrame(rafId)
   if (resizeObserver) resizeObserver.disconnect()
-  for (const n of nodes) {
-    n.mesh.geometry.dispose()
-    n.mesh.material.dispose()
-    n.trailGeom.dispose()
-    n.trail.material.dispose()
-  }
-  nodes = []
+  clearScene()
   if (renderer) renderer.dispose()
 })
 </script>
@@ -682,6 +732,12 @@ onBeforeUnmount(() => {
 .source-label {
   opacity: 0.6;
   font-size: 10px;
+}
+.source-sep {
+  display: inline-block;
+  width: 1px;
+  height: 14px;
+  background: rgba(111, 214, 255, 0.25);
 }
 .stock-swarm-event {
   position: absolute;

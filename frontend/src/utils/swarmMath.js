@@ -73,6 +73,38 @@ export function topKEigen(matrix, k = 2, iters = 300) {
   return eigs
 }
 
+// AR(1) fit on the log-returns of a price series: r_{t+1} = phi * r_t + drift.
+// Constrains phi to [-0.99, 0.99] to keep recursive forecasts stable.
+export function ar1Fit(series) {
+  const r = toLogReturns(series)
+  if (r.length < 2) return { phi: 0, drift: 0 }
+  let mean = 0
+  for (let i = 0; i < r.length; i++) mean += r[i]
+  mean /= r.length
+  let num = 0, den = 0
+  for (let i = 1; i < r.length; i++) {
+    const a = r[i - 1] - mean
+    num += (r[i] - mean) * a
+    den += a * a
+  }
+  let phi = den > 0 ? num / den : 0
+  if (phi > 0.99) phi = 0.99
+  if (phi < -0.99) phi = -0.99
+  const drift = mean * (1 - phi)
+  return { phi, drift }
+}
+
+// Mean/stdev of a numeric array.
+export function seriesStats(arr) {
+  const n = arr.length
+  let mean = 0
+  for (let i = 0; i < n; i++) mean += arr[i]
+  mean /= n
+  let v = 0
+  for (let i = 0; i < n; i++) { const d = arr[i] - mean; v += d * d }
+  return { mean, std: Math.sqrt(v / n) || 1 }
+}
+
 // 2D embedding of tickers from the correlation matrix: coords = eigenvector
 // scaled by sqrt(|eigenvalue|). Returns array of [x, z] pairs in the same
 // order as the input symbol list.
