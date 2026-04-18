@@ -1183,9 +1183,14 @@ function animate(t) {
   if (predict.value) updateGhosts(cursor.value)
   if (loaded.value) updateLabels()
 
-  // Slow camera yaw for god's-eye feel
-  const camR = 160
-  const camY = 78
+  // Intro dolly: on first loaded frame, start the camera pulled far back
+  // and ease in over ~2s so the scene reveals itself.
+  if (loaded.value && animate._introStart == null) animate._introStart = t
+  const intro = animate._introStart == null ? 0
+    : Math.min(1, (t - animate._introStart) / 2200)
+  const eased = 1 - Math.pow(1 - intro, 3)          // ease-out cubic
+  const camR = 160 + (300 - 160) * (1 - eased)      // 300 -> 160
+  const camY = 78  + (160 - 78)  * (1 - eased)      // 160 -> 78
   const theta = t * 0.00006
   camera.position.x = Math.sin(theta) * camR
   camera.position.z = Math.cos(theta) * camR
