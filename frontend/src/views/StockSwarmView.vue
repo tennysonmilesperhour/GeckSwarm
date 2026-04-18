@@ -11,6 +11,29 @@
         </span>
       </div>
     </div>
+    <div
+      v-if="loaded && (divergLeaders.up.length || divergLeaders.down.length)"
+      class="ss-leader"
+    >
+      <div class="ss-leader-title">cluster divergence</div>
+      <div class="ss-leader-cols">
+        <div class="ss-leader-col">
+          <div class="ss-leader-head ss-up">▲ outperforming</div>
+          <div v-for="row in divergLeaders.up" :key="row.symbol" class="ss-leader-row ss-up">
+            <span class="ss-leader-sym">{{ row.symbol }}</span>
+            <span class="ss-leader-val">+{{ row.diverg.toFixed(2) }}σ</span>
+          </div>
+        </div>
+        <div class="ss-leader-col">
+          <div class="ss-leader-head ss-down">▼ lagging</div>
+          <div v-for="row in divergLeaders.down" :key="row.symbol" class="ss-leader-row ss-down">
+            <span class="ss-leader-sym">{{ row.symbol }}</span>
+            <span class="ss-leader-val">{{ row.diverg.toFixed(2) }}σ</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
 
     <div
@@ -142,6 +165,7 @@ const totalDays = ref(0)
 const tickerCount = ref(0)
 const primaryCount = ref(0)
 const childCount = ref(0)
+const divergLeaders = ref({ up: [], down: [] })
 const datesRef = ref([])
 const playing = ref(true)
 const playSpeed = ref(1.2)
@@ -1017,12 +1041,26 @@ function computeDivergence(c) {
     _divGroupMean.set(g, m)
     _divGroupStd.set(g, std)
   }
-  // Pass 3: divergence score per node.
+  // Pass 3: divergence score per node + leaderboard of the top extremes.
+  const leaderInputs = []
   for (const n of nodes) {
     const m = _divGroupMean.get(n.group) ?? 0
     const s = _divGroupStd.get(n.group) ?? 1
     n.diverg = (recent.get(n.symbol) - m) / s
+    // Only surface primaries in the leaderboard so the list stays
+    // actionable (tier-2 kids are implicit via their parent).
+    if ((n.tier ?? 1) <= 1) leaderInputs.push(n)
   }
+  leaderInputs.sort((a, b) => b.diverg - a.diverg)
+  const up = leaderInputs.slice(0, 5).map(n => ({
+    symbol: n.symbol, group: n.group, diverg: n.diverg,
+    price: n.rawPrices[Math.min(c, n.rawPrices.length - 1)],
+  }))
+  const down = leaderInputs.slice(-5).reverse().map(n => ({
+    symbol: n.symbol, group: n.group, diverg: n.diverg,
+    price: n.rawPrices[Math.min(c, n.rawPrices.length - 1)],
+  }))
+  divergLeaders.value = { up, down }
 }
 
 const _tmpColor = new THREE.Color()
@@ -1313,6 +1351,56 @@ onBeforeUnmount(() => {
   opacity: 0.7;
   margin-top: 2px;
 }
+.ss-leader {
+  position: absolute;
+  bottom: 80px;
+  right: 20px;
+  width: 240px;
+  padding: 10px 12px 12px;
+  background: rgba(5, 8, 15, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+.ss-leader-title {
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 6px;
+}
+.ss-leader-cols {
+  display: flex;
+  gap: 8px;
+}
+.ss-leader-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ss-leader-head {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.85;
+  margin-bottom: 3px;
+}
+.ss-leader-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  padding: 1px 0;
+}
+.ss-leader-row.ss-up     .ss-leader-sym { color: #6fffb2; }
+.ss-leader-row.ss-down   .ss-leader-sym { color: #ff6f80; }
+.ss-leader-head.ss-up    { color: #6fffb2; }
+.ss-leader-head.ss-down  { color: #ff6f80; }
+.ss-leader-val { opacity: 0.7; }
 .ss-hover-panel {
   position: fixed;
   min-width: 180px;
