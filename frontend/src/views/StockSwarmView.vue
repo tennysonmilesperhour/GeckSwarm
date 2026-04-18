@@ -101,7 +101,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
-import { ar1Fit, correlationEmbedding, leadLagMatrix, seriesStats } from '../utils/swarmMath.js'
+import { ar1Fit, sectorWheelLayout, seriesStats } from '../utils/swarmMath.js'
 import { Delaunay } from 'd3-delaunay'
 
 const canvasRef = ref(null)
@@ -324,13 +324,14 @@ function buildScene(payload) {
   // that predate tier=0/1/2 (treat undefined tier as tier 1).
   const primaryTickers = payload.tickers.filter(t => (t.tier ?? 1) <= 1)
 
-  // Compute correlation matrix once, then a 2D embedding via PCA.
+  // Sector-wheel layout: anchors at center, primaries arranged around a
+  // ring, angular position driven by sector group. Conceptually related
+  // groups (semis next to tech-mega, banks next to insurance, etc.) are
+  // neighbors so the wheel reads as a sector map.
   const symbols = primaryTickers.map(t => t.symbol)
-  // Lead-lag similarity: for each pair we keep the max-|corr| over ±5-day
-  // shifts, sign preserved. Nodes that lead, follow, or inversely follow
-  // each other all end up near each other; strength governs distance.
-  const simMatrix = leadLagMatrix(symbols, payload.prices, 5)
-  const embedding = correlationEmbedding(simMatrix, LAYOUT_SPAN)
+  const layout = sectorWheelLayout(primaryTickers, {
+    anchorRadius: 10, primaryRadius: Math.min(70, LAYOUT_SPAN * 0.48),
+  })
 
   // Market breadth per day: 2 * fraction-positive - 1, in [-1, +1].
   breadthSeries = computeBreadth(symbols, payload.prices, payload.dates.length)
@@ -340,7 +341,7 @@ function buildScene(payload) {
     const row = Math.floor(idx / GRID_COLS)
     const gridX = originX + col * COL_SPACING
     const gridZ = originZ + row * ROW_SPACING
-    const [targetX, targetZ] = embedding[idx]
+    const [targetX, targetZ] = layout.get(t.symbol) ?? [0, 0]
 
     const normSeries = normalizeZScore(payload.prices[t.symbol])
     const color = GROUP_COLORS[t.group] ?? TIER_COLORS[t.tier] ?? 0xffffff
