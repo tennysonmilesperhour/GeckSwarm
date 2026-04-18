@@ -157,6 +157,7 @@ const canvasRef = ref(null)
 const trackRef = ref(null)
 const labelLayerRef = ref(null)
 const hovered = ref(null) // { node, x, y }
+const focused = ref(null) // symbol of focused primary; null = no focus
 const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
@@ -405,7 +406,7 @@ function buildScene(payload) {
 
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(size, 16, 12),
-      new THREE.MeshBasicMaterial({ color })
+      new THREE.MeshBasicMaterial({ color, transparent: true })
     )
     mesh.position.set(gridX, normSeries[0] * Y_SCALE, gridZ)
     scene.add(mesh)
@@ -1133,6 +1134,7 @@ function animate(t) {
   updateEdges()
   updateBlanket(t * 0.001)
   updateFlow(dt)
+  applyFocus()
   updateWind(cursor.value)
   if (predict.value) updateGhosts(cursor.value)
   if (loaded.value) updateLabels()
@@ -1276,6 +1278,44 @@ function onPointerMove(evt) {
 }
 function onPointerLeave() { hovered.value = null }
 
+function onPointerDown(evt) {
+  if (evt.button !== 0) return
+  if (!renderer || !camera || !nodes.length) return
+  const canvas = renderer.domElement
+  const rect = canvas.getBoundingClientRect()
+  ndcVec.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1
+  ndcVec.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1
+  raycaster.setFromCamera(ndcVec, camera)
+  if (lastHoverMeshes.length !== nodes.length) lastHoverMeshes = nodes.map(n => n.mesh)
+  const hits = raycaster.intersectObjects(lastHoverMeshes, false)
+  if (!hits.length) { focused.value = null; return }
+  const node = nodes.find(n => n.mesh === hits[0].object)
+  if (!node) { focused.value = null; return }
+  if ((node.tier ?? 1) === 2) return // skip focusing tier-2 for now
+  focused.value = focused.value === node.symbol ? null : node.symbol
+}
+
+// Dim everything that isn't the focused primary / its children / anchors.
+function applyFocus() {
+  const f = focused.value
+  if (f == null) {
+    for (const n of nodes) {
+      n.mesh.material.opacity = (n.tier === 2 ? 0.78 : 1.0)
+    }
+    if (edgeMesh) edgeMesh.material.opacity = 0.22
+    return
+  }
+  for (const n of nodes) {
+    const inFocus =
+      n.symbol === f ||
+      n.parentSym === f ||
+      (n.tier === 0)       // keep anchors visible as reference
+    n.mesh.material.transparent = true
+    n.mesh.material.opacity = inFocus ? 1.0 : 0.12
+  }
+  if (edgeMesh) edgeMesh.material.opacity = 0.09
+}
+
 // Helper to format the live price under the hover panel.
 const hoverPrice = computed(() => {
   const h = hovered.value
@@ -1305,6 +1345,7 @@ onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   canvas.addEventListener('pointermove', onPointerMove)
   canvas.addEventListener('pointerleave', onPointerLeave)
+  canvas.addEventListener('pointerdown', onPointerDown)
 
   await loadData()
   animate(0)
