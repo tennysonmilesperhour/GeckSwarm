@@ -392,6 +392,59 @@ function buildScene(payload) {
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
   })
+
+  // --- Tier-2 children: render as smaller dim orbital dots around their
+  // strongest-weighted primary parent. No trails / no labels / no ghosts
+  // (keeps DOM + draw cost bounded even at 330+ children).
+  const childTickers = payload.tickers.filter(t => (t.tier ?? 1) === 2)
+  const childOrbitRadius = 7.5
+  const childSize = 0.55
+  // Track how many children have been placed around each parent so orbit
+  // angles spread evenly.
+  const orbitCounts = new Map()
+  for (const t of childTickers) {
+    if (!payload.prices[t.symbol]) continue
+    // Find strongest-absolute-weight parent that we have laid out.
+    let parentSym = null
+    let parentW = 0
+    for (const p of (t.parents || [])) {
+      const parentNode = nodeBySymbol.get(p.symbol)
+      if (!parentNode) continue
+      if (Math.abs(p.weight) > Math.abs(parentW)) { parentSym = p.symbol; parentW = p.weight }
+    }
+    const parentNode = parentSym ? nodeBySymbol.get(parentSym) : null
+    if (!parentNode) continue
+
+    const orbitIdx = orbitCounts.get(parentSym) ?? 0
+    orbitCounts.set(parentSym, orbitIdx + 1)
+    // Spread up to 10 kids around the parent; beyond that wrap around.
+    const theta = (orbitIdx % 10) * (Math.PI * 2 / 10) + (orbitIdx >= 10 ? Math.PI / 10 : 0)
+    const orbitR = childOrbitRadius + (orbitIdx >= 10 ? 3 : 0)
+    const targetX = parentNode.targetX + Math.cos(theta) * orbitR
+    const targetZ = parentNode.targetZ + Math.sin(theta) * orbitR
+
+    const normSeries = normalizeZScore(payload.prices[t.symbol])
+    const color = GROUP_COLORS[parentNode.group] ?? GROUP_COLORS[t.group] ?? 0x9fd2ff
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(childSize, 10, 8),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.78, depthWrite: false }),
+    )
+    mesh.position.set(targetX, normSeries[0] * Y_SCALE, targetZ)
+    scene.add(mesh)
+    const rawPrices = payload.prices[t.symbol]
+    const node = {
+      symbol: t.symbol, tier: 2,
+      mesh, trail: null, trailGeom: null, trailPositions: null,
+      ghost: null,
+      normSeries, rawPrices,
+      phi: 0, drift: 0, priceMean: rawPrices[0], priceStd: 1,
+      x: targetX, z: targetZ, targetX, targetZ,
+      parentSym,
+      group: parentNode.group,
+    }
+    nodes.push(node)
+    nodeBySymbol.set(t.symbol, node)
+  }
 }
 
 function predictY(node, c, H) {
@@ -412,10 +465,8 @@ function updateGhosts(c) {
   const visible = predict.value
   const H = horizon.value
   for (const n of nodes) {
-    if (!visible) {
-      if (n.ghost.visible) n.ghost.visible = false
-      continue
-    }
+    if (!n.ghost) continue
+    if (!visible) { if (n.ghost.visible) n.ghost.visible = false; continue }
     n.ghost.visible = true
     n.ghost.position.set(n.x, predictY(n, c, H), n.z + 2.2)
   }
@@ -564,29 +615,50 @@ function updateBlanket(elapsed) {
 function buildEdges() {
   disposeEdges()
   if (nodes.length < 3) return
-  const pts = new Float64Array(nodes.length * 2)
+  // Two edge sources:
+  //   1. Delaunay triangulation over anchors + primaries only (tier <= 1)
+  //      so the outer ring reads as a clean sector grid.
+  //   2. Declared parent-child edges for tier-2 kids -> primary parent
+  //      so each child orbit also shows a thin spoke to its hub.
+  const primaryIdx = []
   for (let i = 0; i < nodes.length; i++) {
-    pts[i * 2] = nodes[i].targetX
-    pts[i * 2 + 1] = nodes[i].targetZ
+    if ((nodes[i].tier ?? 1) <= 1) primaryIdx.push(i)
   }
+  const pts = new Float64Array(primaryIdx.length * 2)
+  primaryIdx.forEach((ni, j) => {
+    pts[j * 2] = nodes[ni].targetX
+    pts[j * 2 + 1] = nodes[ni].targetZ
+  })
   const delaunay = new Delaunay(pts)
   const seen = new Set()
   edgePairs = []
   const tri = delaunay.triangles
   for (let k = 0; k < tri.length; k += 3) {
-    const a = tri[k], b = tri[k + 1], c = tri[k + 2]
+    const a = primaryIdx[tri[k]], b = primaryIdx[tri[k + 1]], c = primaryIdx[tri[k + 2]]
     for (const [u, v] of [[a, b], [b, c], [c, a]]) {
       const lo = Math.min(u, v), hi = Math.max(u, v)
-      const key = lo * 1024 + hi
+      const key = lo * 8192 + hi
       if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
     }
+  }
+  // Child -> primary spokes
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i]
+    if (n.tier !== 2 || !n.parentSym) continue
+    const parent = nodeBySymbol.get(n.parentSym)
+    if (!parent) continue
+    const pi = nodes.indexOf(parent)
+    if (pi < 0) continue
+    const lo = Math.min(i, pi), hi = Math.max(i, pi)
+    const key = lo * 8192 + hi
+    if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
   }
 
   const positions = new Float32Array(edgePairs.length * 2 * 3)
   const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   const mat = new THREE.LineBasicMaterial({
-    color: 0xffffff, transparent: true, opacity: 0.28, depthWrite: false,
+    color: 0xffffff, transparent: true, opacity: 0.22, depthWrite: false,
   })
   edgeMesh = new THREE.LineSegments(geom, mat)
   scene.add(edgeMesh)
@@ -626,6 +698,9 @@ function buildLabels() {
   const layer = labelLayerRef.value
   if (!layer) return
   for (const n of nodes) {
+    // Skip labels for tier-2 children to keep the DOM and per-frame work
+    // bounded; their identity is implied by orbiting their labeled parent.
+    if (n.tier === 2) { n.labelEl = null; continue }
     const el = document.createElement('div')
     el.className = 'ss-label'
     el.textContent = n.symbol
@@ -752,6 +827,7 @@ function applySmoothCursor() {
   for (const n of nodes) {
     const y = sampleY(n.normSeries, cf) * Y_SCALE
     n.mesh.position.y = y
+    if (!n.trailPositions) continue // tier-2 children don't get trails
     const p = n.trailPositions
     const last = (TRAIL_LEN - 1) * 3
     if (crossed) {
@@ -780,6 +856,7 @@ function jumpCursor(next) {
   for (const n of nodes) {
     const y = n.normSeries[c] * Y_SCALE
     n.mesh.position.y = y
+    if (!n.trailPositions) continue // tier-2 children don't get trails
     const p = n.trailPositions
     for (let i = 0; i < TRAIL_LEN; i++) {
       const srcIdx = Math.max(0, c - (TRAIL_LEN - 1 - i))
@@ -864,10 +941,10 @@ async function fetchReal() {
 
 function clearScene() {
   for (const n of nodes) {
-    scene.remove(n.mesh); scene.remove(n.trail); scene.remove(n.ghost)
+    scene.remove(n.mesh)
     n.mesh.geometry.dispose(); n.mesh.material.dispose()
-    n.trailGeom.dispose(); n.trail.material.dispose()
-    n.ghost.geometry.dispose(); n.ghost.material.dispose()
+    if (n.trail)  { scene.remove(n.trail); n.trailGeom.dispose(); n.trail.material.dispose() }
+    if (n.ghost)  { scene.remove(n.ghost); n.ghost.geometry.dispose(); n.ghost.material.dispose() }
   }
   nodes = []
   nodeBySymbol = new Map()
