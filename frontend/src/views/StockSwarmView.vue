@@ -34,6 +34,11 @@
       </div>
     </div>
 
+    <div v-if="focused" class="ss-focus-hud">
+      focused: <span class="ss-focus-sym">{{ focused }}</span>
+      <span class="ss-focus-hint">click empty / Esc to clear</span>
+    </div>
+
     <div v-if="loaded" class="ss-legend">
       <div class="ss-legend-title">edges</div>
       <div class="ss-legend-row"><span class="ss-swatch" style="background:#72bfff" /> supplier</div>
@@ -57,7 +62,19 @@
         <span class="ss-hover-tier">T{{ hovered.node.tier }}</span>
       </div>
       <div class="ss-hover-name">{{ hovered.node.name || '' }}</div>
-      <div class="ss-hover-price">${{ hoverPrice }}</div>
+      <div class="ss-hover-price-row">
+        <span class="ss-hover-price">${{ hoverPrice }}</span>
+        <span
+          v-if="hoverDay != null"
+          class="ss-hover-delta"
+          :data-dir="pctClass(hoverDay)"
+        >{{ fmtPct(hoverDay) }}</span>
+      </div>
+      <div
+        v-if="hoverSince != null"
+        class="ss-hover-since"
+        :data-dir="pctClass(hoverSince)"
+      >since start · {{ fmtPct(hoverSince) }}</div>
       <div class="ss-hover-group">{{ hovered.node.group }}</div>
       <div v-if="hovered.node.parentSym" class="ss-hover-parent">
         orbits → {{ hovered.node.parentSym }}
@@ -273,6 +290,8 @@ function onKeydown(evt) {
     jumpCursor(0); evt.preventDefault()
   } else if (evt.key === 'End') {
     jumpCursor(totalDays.value - 1); evt.preventDefault()
+  } else if (evt.key === 'Escape') {
+    focused.value = null
   }
 }
 
@@ -744,6 +763,7 @@ function disposeFlow() {
 function updateFlow(dt) {
   if (!flow) return
   const { edges, positions, colors } = flow
+  const f = focused.value
   for (let i = 0; i < edges.length; i++) {
     const e = edges[i]
     e.t += e.speed * dt
@@ -753,18 +773,19 @@ function updateFlow(dt) {
     const p = i * 3
     const u = e.t
     positions[p]     = fx + (tx - fx) * u
-    positions[p + 1] = fy + (ty - fy) * u + 0.3 // lift a hair so particles ride above lines
+    positions[p + 1] = fy + (ty - fy) * u + 0.3
     positions[p + 2] = fz + (tz - fz) * u
-    // Color tint: use the child's group color, brighter at higher t so
-    // particles fade from parent to child in their own glow.
     const groupColor = GROUP_COLORS[e.to.group] ?? 0xa8e4ff
     const r = ((groupColor >> 16) & 0xff) / 255
     const g = ((groupColor >> 8) & 0xff) / 255
     const b = (groupColor & 0xff) / 255
     const fade = 0.55 + 0.45 * u
-    colors[p]     = r * fade
-    colors[p + 1] = g * fade
-    colors[p + 2] = b * fade
+    // When a primary is focused, dim particles that don't belong to its
+    // outgoing flow. The focused primary's own flow stays bright.
+    const focusMul = f == null ? 1.0 : (e.from.symbol === f ? 1.2 : 0.10)
+    colors[p]     = r * fade * focusMul
+    colors[p + 1] = g * fade * focusMul
+    colors[p + 2] = b * fade * focusMul
   }
   flow.geom.attributes.position.needsUpdate = true
   flow.geom.attributes.color.needsUpdate = true
@@ -1365,15 +1386,41 @@ function applyFocus() {
   if (edgeMesh) edgeMesh.material.opacity = 0.09
 }
 
-// Helper to format the live price under the hover panel.
+// Helper to format the live price + deltas under the hover panel.
+function hoverCursor() {
+  return Math.max(0, Math.min(totalDays.value - 1, Math.floor(cursorF)))
+}
 const hoverPrice = computed(() => {
   const h = hovered.value
   if (!h) return ''
-  const c = Math.max(0, Math.min(totalDays.value - 1, Math.floor(cursorF)))
-  const p = h.node.rawPrices?.[c]
+  const p = h.node.rawPrices?.[hoverCursor()]
   if (p == null) return ''
   return p >= 1000 ? p.toFixed(0) : p.toFixed(2)
 })
+const hoverDay = computed(() => {
+  const h = hovered.value
+  if (!h) return null
+  const c = hoverCursor()
+  const s = h.node.rawPrices
+  if (!s || c < 1) return null
+  const pct = ((s[c] - s[c - 1]) / s[c - 1]) * 100
+  return pct
+})
+const hoverSince = computed(() => {
+  const h = hovered.value
+  if (!h) return null
+  const s = h.node.rawPrices
+  if (!s || s.length < 2) return null
+  return ((s[hoverCursor()] - s[0]) / s[0]) * 100
+})
+function fmtPct(v) {
+  if (v == null) return ''
+  return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'
+}
+function pctClass(v) {
+  if (v == null) return 'flat'
+  return v > 0 ? 'up' : v < 0 ? 'down' : 'flat'
+}
 
 onMounted(async () => {
   const canvas = canvasRef.value
@@ -1440,6 +1487,34 @@ onBeforeUnmount(() => {
   font-size: 11px;
   opacity: 0.7;
   margin-top: 2px;
+}
+.ss-focus-hud {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 10px 6px;
+  background: rgba(57, 255, 20, 0.10);
+  border: 1px solid rgba(57, 255, 20, 0.45);
+  border-radius: 3px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  pointer-events: none;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ss-focus-sym {
+  color: #39ff14;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+}
+.ss-focus-hint {
+  opacity: 0.5;
+  font-size: 9px;
 }
 .ss-legend {
   position: absolute;
@@ -1545,7 +1620,15 @@ onBeforeUnmount(() => {
 .ss-hover-sym { font-size: 13px; font-weight: 800; letter-spacing: 0.1em; color: #39ff14; }
 .ss-hover-tier { font-size: 9px; opacity: 0.55; letter-spacing: 0.1em; }
 .ss-hover-name { opacity: 0.8; margin-top: 1px; font-size: 10px; }
-.ss-hover-price { color: #fde68a; font-weight: 700; font-size: 14px; margin: 3px 0; }
+.ss-hover-price-row { display: flex; align-items: baseline; gap: 8px; margin: 3px 0; }
+.ss-hover-price { color: #fde68a; font-weight: 700; font-size: 14px; }
+.ss-hover-delta { font-size: 11px; font-weight: 700; }
+.ss-hover-delta[data-dir="up"]   { color: #6fffb2; }
+.ss-hover-delta[data-dir="down"] { color: #ff6f80; }
+.ss-hover-delta[data-dir="flat"] { color: #fff; opacity: 0.6; }
+.ss-hover-since { font-size: 10px; opacity: 0.55; margin-top: 1px; }
+.ss-hover-since[data-dir="up"]   { color: #6fffb2; opacity: 0.8; }
+.ss-hover-since[data-dir="down"] { color: #ff6f80; opacity: 0.8; }
 .ss-hover-group { opacity: 0.55; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; }
 .ss-hover-parent { opacity: 0.7; font-size: 10px; margin-top: 4px; color: #a8e4ff; }
 .stock-swarm-labels {
