@@ -39,6 +39,18 @@
       <span class="ss-focus-hint">click empty / Esc to clear</span>
     </div>
 
+    <div v-if="loaded" class="ss-help" @pointerenter="helpOpen = true" @pointerleave="helpOpen = false">
+      <div class="ss-help-trigger">?</div>
+      <div v-if="helpOpen" class="ss-help-panel">
+        <div class="ss-help-row"><kbd>click</kbd> primary → focus cluster</div>
+        <div class="ss-help-row"><kbd>Esc</kbd> / click empty → clear focus</div>
+        <div class="ss-help-row"><kbd>Space</kbd> play / pause</div>
+        <div class="ss-help-row"><kbd>←</kbd><kbd>→</kbd> scrub 1 bar · <kbd>Shift+</kbd> 20 bars</div>
+        <div class="ss-help-row"><kbd>Home</kbd> / <kbd>End</kbd> jump to start / end</div>
+        <div class="ss-help-row"><kbd>hover</kbd> any node for ticker + price + relations</div>
+      </div>
+    </div>
+
     <div v-if="loaded" class="ss-legend">
       <div class="ss-legend-title">edges</div>
       <div class="ss-legend-row"><span class="ss-swatch" style="background:#72bfff" /> supplier</div>
@@ -175,7 +187,7 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as THREE from 'three'
 import { ar1Fit, sectorWheelLayout, seriesStats } from '../utils/swarmMath.js'
 import { NODE_META } from '../data/hierarchy.js'
@@ -186,6 +198,7 @@ const trackRef = ref(null)
 const labelLayerRef = ref(null)
 const hovered = ref(null) // { node, x, y }
 const focused = ref(null) // symbol of focused primary; null = no focus
+const helpOpen = ref(false)
 const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
@@ -729,11 +742,17 @@ function buildFlow() {
       }
     }
     // Spawn FLOW_PARTICLES_PER_EDGE particles along this edge at offset t.
+    // `liveCorr` is the 20-bar rolling correlation, refreshed on each bar
+    // crossing; flow speed uses |liveCorr| * weight so visibly slows when
+    // the relationship breaks down, speeds up when it's tight.
+    const baseSpeed = Math.max(0.1, Math.abs(weight)) * FLOW_SPEED_BASE
     for (let k = 0; k < FLOW_PARTICLES_PER_EDGE; k++) {
       edges.push({
         from: parent, to: n,
         t: k / FLOW_PARTICLES_PER_EDGE,
-        speed: Math.max(0.1, Math.abs(weight)) * FLOW_SPEED_BASE,
+        baseSpeed,
+        liveCorr: Math.abs(weight),
+        speed: baseSpeed,
       })
     }
   }
@@ -1058,8 +1077,41 @@ function applySmoothCursor() {
     cursor.value = c
     updateEvents(c)
     computeDivergence(c)
+    refreshFlowCorrelations(c)
   }
   applyDivergence()
+}
+
+// Refresh each tier-2 flow edge's 20-bar rolling correlation with its
+// primary parent; flow speed is updated in updateFlow to track this.
+function refreshFlowCorrelations(c) {
+  if (!flow) return
+  const W = 20
+  for (const e of flow.edges) {
+    const pr = e.from.rawPrices
+    const cr = e.to.rawPrices
+    if (!pr || !cr) continue
+    const end = Math.min(c, pr.length - 1, cr.length - 1)
+    const start = Math.max(1, end - W + 1)
+    const len = end - start + 1
+    if (len < 3) { e.liveCorr = 0; continue }
+    let ma = 0, mb = 0
+    for (let i = start; i <= end; i++) {
+      ma += Math.log(pr[i] / pr[i - 1])
+      mb += Math.log(cr[i] / cr[i - 1])
+    }
+    ma /= len; mb /= len
+    let num = 0, da = 0, db = 0
+    for (let i = start; i <= end; i++) {
+      const x = Math.log(pr[i] / pr[i - 1]) - ma
+      const y = Math.log(cr[i] / cr[i - 1]) - mb
+      num += x * y; da += x * x; db += y * y
+    }
+    const d = Math.sqrt(da * db)
+    const corr = d === 0 ? 0 : num / d
+    e.liveCorr = Math.abs(corr)
+    e.speed = e.baseSpeed * (0.25 + 0.85 * e.liveCorr)
+  }
 }
 
 // Divergence: how far each node's recent return has drifted away from
@@ -1311,6 +1363,11 @@ async function loadData() {
     cursorF = 0
     lastBarIdx = 0
     loaded.value = true
+    // Restore focus from URL (e.g. /stock-swarm?focus=AAPL deep-link).
+    const urlFocus = readFocusFromUrl()
+    if (urlFocus && nodeBySymbol.has(urlFocus)) {
+      focused.value = urlFocus
+    }
   } catch (e) {
     loadError.value = `Failed to load data: ${e.message}`
   }
@@ -1347,6 +1404,25 @@ function onPointerMove(evt) {
   hovered.value = null
 }
 function onPointerLeave() { hovered.value = null }
+
+// Reflect focus in the URL so deep-links like /stock-swarm?focus=AAPL work.
+function syncFocusToUrl() {
+  if (typeof window === 'undefined') return
+  try {
+    const url = new URL(window.location.href)
+    const f = focused.value
+    if (f) url.searchParams.set('focus', f)
+    else url.searchParams.delete('focus')
+    window.history.replaceState(null, '', url)
+  } catch {}
+}
+function readFocusFromUrl() {
+  if (typeof window === 'undefined') return null
+  try {
+    return new URL(window.location.href).searchParams.get('focus')
+  } catch { return null }
+}
+watch(focused, syncFocusToUrl)
 
 function onPointerDown(evt) {
   if (evt.button !== 0) return
@@ -1487,6 +1563,59 @@ onBeforeUnmount(() => {
   font-size: 11px;
   opacity: 0.7;
   margin-top: 2px;
+}
+.ss-help {
+  position: absolute;
+  bottom: 80px;
+  left: 20px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  z-index: 20;
+}
+.ss-help-trigger {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  background: rgba(5, 8, 15, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 50%;
+  color: #9fd2ff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: help;
+  user-select: none;
+}
+.ss-help-panel {
+  position: absolute;
+  bottom: 28px;
+  left: 0;
+  width: 280px;
+  padding: 10px 12px;
+  background: rgba(5, 8, 15, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.6;
+  backdrop-filter: blur(6px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+}
+.ss-help-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  opacity: 0.85;
+  flex-wrap: wrap;
+}
+.ss-help-row kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 9px;
+  color: #9fd2ff;
 }
 .ss-focus-hud {
   position: absolute;
