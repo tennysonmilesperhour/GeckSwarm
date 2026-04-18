@@ -2,12 +2,14 @@
   <div class="stock-swarm-root">
     <canvas ref="canvasRef" class="stock-swarm-canvas" />
     <div class="stock-swarm-hud">
-      <div class="hud-title">Stock Swarm · Wave Field</div>
+      <div class="hud-title">Stock Swarm · Fluid Dynamics of Influence</div>
       <div class="hud-sub">
         <span v-if="!loaded">loading…</span>
         <span v-else>
-          {{ primaryCount }} primaries · {{ childCount }} substocks ·
-          {{ currentDate }} ({{ cursor + 1 }}/{{ totalDays }})
+          <b>{{ primaryCount }}</b> primaries ·
+          <b>{{ childCount }}</b> substocks ·
+          <b>{{ currentDate }}</b>
+          <span class="hud-sub-day">({{ cursor + 1 }} / {{ totalDays }})</span>
         </span>
       </div>
     </div>
@@ -63,6 +65,7 @@
     </div>
 
     <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
+    <div ref="sectorLayerRef" class="ss-sector-labels" aria-hidden="true" />
 
     <div
       v-if="hovered"
@@ -196,6 +199,7 @@ import { Delaunay } from 'd3-delaunay'
 const canvasRef = ref(null)
 const trackRef = ref(null)
 const labelLayerRef = ref(null)
+const sectorLayerRef = ref(null)
 const hovered = ref(null) // { node, x, y }
 const focused = ref(null) // symbol of focused primary; null = no focus
 const helpOpen = ref(false)
@@ -950,6 +954,58 @@ function disposeLabels() {
     if (n.labelEl) { n.labelEl.remove(); n.labelEl = null; n.labelPriceEl = null }
   }
   if (labelLayerRef.value) labelLayerRef.value.innerHTML = ''
+  if (sectorLayerRef.value) sectorLayerRef.value.innerHTML = ''
+  sectorLabels = []
+}
+
+// Sector group labels floating just outside the primary ring so the wheel
+// is labeled at a glance. One label per sector group, positioned at the
+// mean XZ of its primaries, pushed outward by OUTSET world units.
+let sectorLabels = []  // [{ el, x, z, y }]
+function buildSectorLabels() {
+  if (!sectorLayerRef.value) return
+  sectorLayerRef.value.innerHTML = ''
+  const buckets = new Map()  // group -> {sum_x, sum_z, count}
+  for (const n of nodes) {
+    if ((n.tier ?? 1) !== 1 || !n.group) continue
+    const b = buckets.get(n.group) ?? { x: 0, z: 0, n: 0 }
+    b.x += n.targetX; b.z += n.targetZ; b.n += 1
+    buckets.set(n.group, b)
+  }
+  const OUTSET = 24
+  sectorLabels = []
+  for (const [g, b] of buckets) {
+    const cx = b.x / b.n, cz = b.z / b.n
+    const d = Math.hypot(cx, cz) || 1
+    const el = document.createElement('div')
+    el.className = 'ss-sector-label'
+    el.textContent = g.replace(/-/g, ' ')
+    el.style.setProperty(
+      '--group-color',
+      '#' + new THREE.Color(GROUP_COLORS[g] ?? 0xffffff).getHexString()
+    )
+    sectorLayerRef.value.appendChild(el)
+    sectorLabels.push({
+      el,
+      x: cx + (cx / d) * OUTSET,
+      y: 0,
+      z: cz + (cz / d) * OUTSET,
+    })
+  }
+}
+
+function updateSectorLabels() {
+  const canvas = renderer?.domElement
+  if (!canvas || !sectorLabels.length) return
+  const w = canvas.clientWidth, h = canvas.clientHeight
+  for (const s of sectorLabels) {
+    tmpVec.set(s.x, s.y, s.z).project(camera)
+    if (tmpVec.z > 1) { s.el.style.opacity = '0'; continue }
+    const x = (tmpVec.x * 0.5 + 0.5) * w
+    const y = (-tmpVec.y * 0.5 + 0.5) * h
+    s.el.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(-50%, -50%)`
+    s.el.style.opacity = '0.65'
+  }
 }
 
 const tmpVec = new THREE.Vector3()
@@ -1254,7 +1310,7 @@ function animate(t) {
   applyFocus()
   updateWind(cursor.value)
   if (predict.value) updateGhosts(cursor.value)
-  if (loaded.value) updateLabels()
+  if (loaded.value) { updateLabels(); updateSectorLabels() }
 
   // Intro dolly: on first loaded frame, start the camera pulled far back
   // and ease in over ~2s so the scene reveals itself.
@@ -1357,6 +1413,7 @@ async function loadData() {
     buildWindField()
     buildEvents(eventsJson, payload.dates)
     buildLabels()
+    buildSectorLabels()
     buildFlow()
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
@@ -1554,16 +1611,20 @@ onBeforeUnmount(() => {
   text-shadow: 0 0 8px rgba(0, 0, 0, 0.8);
 }
 .hud-title {
-  font-size: 14px;
-  letter-spacing: 0.14em;
+  font-size: 12px;
+  letter-spacing: 0.18em;
   text-transform: uppercase;
-  opacity: 0.9;
+  opacity: 0.92;
+  color: #9fd2ff;
 }
 .hud-sub {
   font-size: 11px;
-  opacity: 0.7;
-  margin-top: 2px;
+  opacity: 0.75;
+  margin-top: 3px;
+  color: #fff;
 }
+.hud-sub b { color: #39ff14; font-weight: 700; }
+.hud-sub-day { opacity: 0.55; margin-left: 4px; }
 .ss-help {
   position: absolute;
   bottom: 80px;
@@ -1765,6 +1826,29 @@ onBeforeUnmount(() => {
   inset: 0;
   pointer-events: none;
   overflow: hidden;
+}
+.ss-sector-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.ss-sector-label {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--group-color, #fff);
+  white-space: nowrap;
+  transform: translate(-9999px, -9999px);
+  pointer-events: none;
+  opacity: 0.65;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.9), 0 0 8px var(--group-color, #fff);
+  transition: opacity 0.12s linear;
 }
 .ss-label {
   position: absolute;
