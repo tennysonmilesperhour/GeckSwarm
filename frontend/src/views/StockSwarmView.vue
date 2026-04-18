@@ -6,7 +6,8 @@
       <div class="hud-sub">
         <span v-if="!loaded">loading…</span>
         <span v-else>
-          {{ tickerCount }} nodes · {{ currentDate }} ({{ cursor + 1 }}/{{ totalDays }})
+          {{ primaryCount }} primaries · {{ childCount }} substocks ·
+          {{ currentDate }} ({{ cursor + 1 }}/{{ totalDays }})
         </span>
       </div>
     </div>
@@ -139,6 +140,8 @@ const loadError = ref('')
 const cursor = ref(0)
 const totalDays = ref(0)
 const tickerCount = ref(0)
+const primaryCount = ref(0)
+const childCount = ref(0)
 const datesRef = ref([])
 const playing = ref(true)
 const playSpeed = ref(1.2)
@@ -246,7 +249,7 @@ const ROW_SPACING = 14
 const LAYOUT_SPAN = 140          // width/depth of the correlation embedding
 const LAYOUT_EASE = 0.04         // per-frame lerp toward target XZ (0..1)
 const Y_SCALE = 6               // visual amplitude per normalized stdev
-const BLANKET_SIZE = 200         // world units covered by the water surface
+const BLANKET_SIZE = 260         // world units covered by the water surface
 const BLANKET_SEGMENTS = 72      // per-axis plane subdivision
 const BLANKET_SIGMA = 13.0       // gaussian falloff in world units
 const BLANKET_Y_SCALE = 0.92     // how tall the blanket ripples relative to node Y
@@ -341,6 +344,8 @@ function buildScene(payload) {
   datesRef.value = payload.dates
   totalDays.value = payload.dates.length
   tickerCount.value = payload.tickers.length
+  primaryCount.value = payload.tickers.filter(t => (t.tier ?? 1) <= 1).length
+  childCount.value = payload.tickers.filter(t => (t.tier ?? 1) === 2).length
 
   const originX = -((GRID_COLS - 1) * COL_SPACING) / 2
   const originZ = -((GRID_ROWS - 1) * ROW_SPACING) / 2
@@ -1095,8 +1100,8 @@ function animate(t) {
   if (loaded.value) updateLabels()
 
   // Slow camera yaw for god's-eye feel
-  const camR = 110
-  const camY = 55
+  const camR = 160
+  const camY = 78
   const theta = t * 0.00006
   camera.position.x = Math.sin(theta) * camR
   camera.position.z = Math.cos(theta) * camR
@@ -1250,7 +1255,7 @@ onMounted(async () => {
   renderer.setClearColor(0x000000, 1)
 
   scene = new THREE.Scene()
-  scene.fog = new THREE.Fog(0x000000, 140, 260)
+  scene.fog = new THREE.Fog(0x000000, 200, 360)
   camera = new THREE.PerspectiveCamera(52, 1, 0.1, 2000)
   camera.position.set(0, 52, 115)
   camera.lookAt(0, 0, 0)
