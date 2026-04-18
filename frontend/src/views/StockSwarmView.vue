@@ -34,6 +34,17 @@
       </div>
     </div>
 
+    <div v-if="loaded" class="ss-legend">
+      <div class="ss-legend-title">edges</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#72bfff" /> supplier</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#ffb44d" /> customer</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#ff5959" /> rival</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#72ff8d" /> partner</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#66ffe4" /> ecosystem</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#c28cff" /> holding</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#bcbcc2" /> peer</div>
+    </div>
+
     <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
 
     <div
@@ -762,14 +773,22 @@ function updateFlow(dt) {
 // Delaunay triangulation of the target-XZ positions gives each node its
 // natural planar neighbors — denser where nodes cluster, sparser at the
 // edges, and always providing 360° coverage around each node.
+// Relation -> edge color. Delaunay peer edges and unclassified stay white.
+const RELATION_COLORS = {
+  supplier:   [0.45, 0.75, 1.00],  // sky blue - upstream input
+  customer:   [1.00, 0.70, 0.30],  // amber    - downstream buyer
+  rival:      [1.00, 0.35, 0.35],  // red      - direct competitor
+  peer:       [0.75, 0.75, 0.78],  // neutral gray
+  ecosystem:  [0.40, 1.00, 0.90],  // cyan     - platform tie
+  partner:    [0.45, 1.00, 0.55],  // green    - strategic partner
+  holding:    [0.80, 0.55, 1.00],  // purple   - investment position
+  downstream: [0.45, 0.90, 0.80],  // teal     - downstream revenue
+}
+const DEFAULT_EDGE_COLOR = [0.90, 0.90, 0.95]
+
 function buildEdges() {
   disposeEdges()
   if (nodes.length < 3) return
-  // Two edge sources:
-  //   1. Delaunay triangulation over anchors + primaries only (tier <= 1)
-  //      so the outer ring reads as a clean sector grid.
-  //   2. Declared parent-child edges for tier-2 kids -> primary parent
-  //      so each child orbit also shows a thin spoke to its hub.
   const primaryIdx = []
   for (let i = 0; i < nodes.length; i++) {
     if ((nodes[i].tier ?? 1) <= 1) primaryIdx.push(i)
@@ -782,16 +801,27 @@ function buildEdges() {
   const delaunay = new Delaunay(pts)
   const seen = new Set()
   edgePairs = []
+  const edgeRelations = []
   const tri = delaunay.triangles
   for (let k = 0; k < tri.length; k += 3) {
     const a = primaryIdx[tri[k]], b = primaryIdx[tri[k + 1]], c = primaryIdx[tri[k + 2]]
     for (const [u, v] of [[a, b], [b, c], [c, a]]) {
       const lo = Math.min(u, v), hi = Math.max(u, v)
       const key = lo * 8192 + hi
-      if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
+      if (!seen.has(key)) {
+        seen.add(key)
+        edgePairs.push([lo, hi])
+        // Primary-primary edges: lookup declared relation if the pair appears
+        // in either side's parents list; otherwise treat as a Delaunay peer.
+        const na = nodes[lo], nb = nodes[hi]
+        let rel = null
+        for (const p of (na.parents || [])) if (p.symbol === nb.symbol) { rel = p.relation; break }
+        if (!rel) for (const p of (nb.parents || [])) if (p.symbol === na.symbol) { rel = p.relation; break }
+        edgeRelations.push(rel || 'peer')
+      }
     }
   }
-  // Child -> primary spokes
+  // Child -> primary spokes, relation lookup from the child's parents list.
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i]
     if (n.tier !== 2 || !n.parentSym) continue
@@ -801,14 +831,28 @@ function buildEdges() {
     if (pi < 0) continue
     const lo = Math.min(i, pi), hi = Math.max(i, pi)
     const key = lo * 8192 + hi
-    if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
+    if (!seen.has(key)) {
+      seen.add(key)
+      edgePairs.push([lo, hi])
+      let rel = null
+      for (const p of (n.parents || [])) if (p.symbol === parent.symbol) { rel = p.relation; break }
+      edgeRelations.push(rel || 'peer')
+    }
   }
 
   const positions = new Float32Array(edgePairs.length * 2 * 3)
+  const colors = new Float32Array(edgePairs.length * 2 * 3)
+  for (let i = 0; i < edgePairs.length; i++) {
+    const c = RELATION_COLORS[edgeRelations[i]] || DEFAULT_EDGE_COLOR
+    const o = i * 6
+    colors[o]     = c[0]; colors[o + 1] = c[1]; colors[o + 2] = c[2]
+    colors[o + 3] = c[0]; colors[o + 4] = c[1]; colors[o + 5] = c[2]
+  }
   const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3))
   const mat = new THREE.LineBasicMaterial({
-    color: 0xffffff, transparent: true, opacity: 0.22, depthWrite: false,
+    vertexColors: true, transparent: true, opacity: 0.28, depthWrite: false,
   })
   edgeMesh = new THREE.LineSegments(geom, mat)
   scene.add(edgeMesh)
@@ -1391,6 +1435,40 @@ onBeforeUnmount(() => {
   font-size: 11px;
   opacity: 0.7;
   margin-top: 2px;
+}
+.ss-legend {
+  position: absolute;
+  top: 60px;
+  right: 20px;
+  padding: 8px 10px 9px;
+  background: rgba(5, 8, 15, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+.ss-legend-title {
+  font-size: 8px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 4px;
+}
+.ss-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.5;
+  opacity: 0.8;
+}
+.ss-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
 }
 .ss-leader {
   position: absolute;
