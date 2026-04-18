@@ -224,7 +224,33 @@ const BLANKET_SIZE = 200         // world units covered by the water surface
 const BLANKET_SEGMENTS = 72      // per-axis plane subdivision
 const BLANKET_SIGMA = 13.0       // gaussian falloff in world units
 const BLANKET_Y_SCALE = 0.92     // how tall the blanket ripples relative to node Y
-const NODE_COUNT = 50            // hard-coded; matches the universe size
+const NODE_COUNT = 104           // anchors (4) + primaries (100) — tier 0 + tier 1
+const GROUP_COLORS = {
+  'anchor':        0xffffff,
+  'tech-mega':     0x6fd6ff,
+  'semis':         0xffb86c,
+  'software':      0x7dd3fc,
+  'media':         0xff79c6,
+  'banks':         0xffd166,
+  'insurance':     0xfde68a,
+  'payments':      0xfacc15,
+  'assetmgr':      0xe4a11b,
+  'pharma':        0x50fa7b,
+  'health-svc':    0x4ade80,
+  'medtech':       0x86efac,
+  'energy':        0xff5555,
+  'staples':       0xfca5a5,
+  'discretionary': 0xf472b6,
+  'transport':     0xffa24c,
+  'industrials':   0xa3a3a3,
+  'materials':     0xb45309,
+  'telecom':       0xa78bfa,
+  'utilities':     0x38bdf8,
+  'reits':         0x8be9fd,
+  'gold':          0xf1fa8c,
+  'tobacco':       0xc084fc,
+}
+// Keep TIER_COLORS around as a fallback (tier-2 substocks use a tier gray).
 const TIER_COLORS = {
   1: 0x6fd6ff, 2: 0xa0f0ff, 3: 0xffb86c, 4: 0xff79c6,
   5: 0xffd166, 6: 0xff5555, 7: 0xffa24c, 8: 0x50fa7b,
@@ -293,8 +319,13 @@ function buildScene(payload) {
   const originX = -((GRID_COLS - 1) * COL_SPACING) / 2
   const originZ = -((GRID_ROWS - 1) * ROW_SPACING) / 2
 
+  // Restrict the current render to tier 0 (anchors) + tier 1 (primaries)
+  // only — tier-2 children render in a later pass. Accept legacy stubs
+  // that predate tier=0/1/2 (treat undefined tier as tier 1).
+  const primaryTickers = payload.tickers.filter(t => (t.tier ?? 1) <= 1)
+
   // Compute correlation matrix once, then a 2D embedding via PCA.
-  const symbols = payload.tickers.map(t => t.symbol)
+  const symbols = primaryTickers.map(t => t.symbol)
   // Lead-lag similarity: for each pair we keep the max-|corr| over ±5-day
   // shifts, sign preserved. Nodes that lead, follow, or inversely follow
   // each other all end up near each other; strength governs distance.
@@ -304,7 +335,7 @@ function buildScene(payload) {
   // Market breadth per day: 2 * fraction-positive - 1, in [-1, +1].
   breadthSeries = computeBreadth(symbols, payload.prices, payload.dates.length)
 
-  payload.tickers.forEach((t, idx) => {
+  primaryTickers.forEach((t, idx) => {
     const col = idx % GRID_COLS
     const row = Math.floor(idx / GRID_COLS)
     const gridX = originX + col * COL_SPACING
@@ -312,9 +343,9 @@ function buildScene(payload) {
     const [targetX, targetZ] = embedding[idx]
 
     const normSeries = normalizeZScore(payload.prices[t.symbol])
-    const color = TIER_COLORS[t.tier] ?? 0xffffff
-    // Tier scales node size: mega-caps and anchors read as "larger waves".
-    const size = 1.9 - Math.min(0.6, (t.tier - 1) * 0.04)
+    const color = GROUP_COLORS[t.group] ?? TIER_COLORS[t.tier] ?? 0xffffff
+    // Anchors bigger than primaries, primaries bigger than tier-2 children.
+    const size = t.tier === 0 ? 2.3 : (t.tier === 1 ? 1.7 : 1.0)
 
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(size, 16, 12),
