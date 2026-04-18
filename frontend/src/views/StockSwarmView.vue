@@ -12,6 +12,30 @@
     </div>
     <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
 
+    <div
+      v-if="hovered"
+      class="ss-hover-panel"
+      :style="{ left: (hovered.x + 14) + 'px', top: (hovered.y - 10) + 'px' }"
+    >
+      <div class="ss-hover-row">
+        <span class="ss-hover-sym">{{ hovered.node.symbol }}</span>
+        <span class="ss-hover-tier">T{{ hovered.node.tier }}</span>
+      </div>
+      <div class="ss-hover-name">{{ hovered.node.name || '' }}</div>
+      <div class="ss-hover-price">${{ hoverPrice }}</div>
+      <div class="ss-hover-group">{{ hovered.node.group }}</div>
+      <div v-if="hovered.node.parentSym" class="ss-hover-parent">
+        orbits → {{ hovered.node.parentSym }}
+      </div>
+      <div
+        v-else-if="hovered.node.parents && hovered.node.parents.length"
+        class="ss-hover-parent"
+      >
+        influenced by →
+        {{ hovered.node.parents.slice(0, 3).map(p => p.symbol).join(', ') }}
+      </div>
+    </div>
+
     <div v-if="loadError" class="stock-swarm-error">{{ loadError }}</div>
 
     <div v-if="activeEvent" class="stock-swarm-event">
@@ -108,6 +132,7 @@ import { Delaunay } from 'd3-delaunay'
 const canvasRef = ref(null)
 const trackRef = ref(null)
 const labelLayerRef = ref(null)
+const hovered = ref(null) // { node, x, y }
 const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
@@ -383,12 +408,14 @@ function buildScene(payload) {
     scene.add(ghost)
 
     const node = {
-      symbol: t.symbol, tier: t.tier, mesh, trail, trailGeom,
+      symbol: t.symbol, tier: t.tier, name: t.name, group: t.group,
+      mesh, trail, trailGeom,
       trailPositions, normSeries, rawPrices,
       phi, drift, priceMean, priceStd,
       ghost,
       x: gridX, z: gridZ,
       targetX, targetZ,
+      parents: t.parents ?? [],
     }
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
@@ -434,14 +461,14 @@ function buildScene(payload) {
     scene.add(mesh)
     const rawPrices = payload.prices[t.symbol]
     const node = {
-      symbol: t.symbol, tier: 2,
+      symbol: t.symbol, tier: 2, name: t.name, group: parentNode.group,
       mesh, trail: null, trailGeom: null, trailPositions: null,
       ghost: null,
       normSeries, rawPrices,
       phi: 0, drift: 0, priceMean: rawPrices[0], priceStd: 1,
       x: targetX, z: targetZ, targetX, targetZ,
       parentSym,
-      group: parentNode.group,
+      parents: t.parents ?? [],
     }
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
@@ -1094,6 +1121,44 @@ function reload() {
   loadData()
 }
 
+// Hover raycaster. Throttled to pointer move events only.
+const raycaster = new THREE.Raycaster()
+const ndcVec = new THREE.Vector2()
+let lastHoverMeshes = []
+function onPointerMove(evt) {
+  if (!renderer || !camera || !nodes.length) return
+  const canvas = renderer.domElement
+  const rect = canvas.getBoundingClientRect()
+  ndcVec.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1
+  ndcVec.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1
+  raycaster.setFromCamera(ndcVec, camera)
+  // Re-cache mesh list only when node count changes.
+  if (lastHoverMeshes.length !== nodes.length) {
+    lastHoverMeshes = nodes.map(n => n.mesh)
+  }
+  const hits = raycaster.intersectObjects(lastHoverMeshes, false)
+  if (hits.length) {
+    const hit = hits[0]
+    const node = nodes.find(n => n.mesh === hit.object)
+    if (node) {
+      hovered.value = { node, x: evt.clientX, y: evt.clientY }
+      return
+    }
+  }
+  hovered.value = null
+}
+function onPointerLeave() { hovered.value = null }
+
+// Helper to format the live price under the hover panel.
+const hoverPrice = computed(() => {
+  const h = hovered.value
+  if (!h) return ''
+  const c = Math.max(0, Math.min(totalDays.value - 1, Math.floor(cursorF)))
+  const p = h.node.rawPrices?.[c]
+  if (p == null) return ''
+  return p >= 1000 ? p.toFixed(0) : p.toFixed(2)
+})
+
 onMounted(async () => {
   const canvas = canvasRef.value
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
@@ -1111,6 +1176,8 @@ onMounted(async () => {
   resizeObserver.observe(canvas.parentElement)
 
   window.addEventListener('keydown', onKeydown)
+  canvas.addEventListener('pointermove', onPointerMove)
+  canvas.addEventListener('pointerleave', onPointerLeave)
 
   await loadData()
   animate(0)
@@ -1157,6 +1224,29 @@ onBeforeUnmount(() => {
   opacity: 0.7;
   margin-top: 2px;
 }
+.ss-hover-panel {
+  position: fixed;
+  min-width: 180px;
+  padding: 8px 10px 9px;
+  background: rgba(5, 8, 15, 0.94);
+  border: 1px solid rgba(57, 255, 20, 0.35);
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.3;
+  pointer-events: none;
+  z-index: 1000;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(6px);
+}
+.ss-hover-row { display: flex; justify-content: space-between; align-items: center; }
+.ss-hover-sym { font-size: 13px; font-weight: 800; letter-spacing: 0.1em; color: #39ff14; }
+.ss-hover-tier { font-size: 9px; opacity: 0.55; letter-spacing: 0.1em; }
+.ss-hover-name { opacity: 0.8; margin-top: 1px; font-size: 10px; }
+.ss-hover-price { color: #fde68a; font-weight: 700; font-size: 14px; margin: 3px 0; }
+.ss-hover-group { opacity: 0.55; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; }
+.ss-hover-parent { opacity: 0.7; font-size: 10px; margin-top: 4px; color: #a8e4ff; }
 .stock-swarm-labels {
   position: absolute;
   inset: 0;
