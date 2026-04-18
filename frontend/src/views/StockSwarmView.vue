@@ -416,6 +416,8 @@ function buildScene(payload) {
       x: gridX, z: gridZ,
       targetX, targetZ,
       parents: t.parents ?? [],
+      baseColor: color,
+      diverg: 0,
     }
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
@@ -469,6 +471,8 @@ function buildScene(payload) {
       x: targetX, z: targetZ, targetX, targetZ,
       parentSym,
       parents: t.parents ?? [],
+      baseColor: color,
+      diverg: 0,
     }
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
@@ -958,6 +962,84 @@ function applySmoothCursor() {
     lastBarIdx = c
     cursor.value = c
     updateEvents(c)
+    computeDivergence(c)
+  }
+  applyDivergence()
+}
+
+// Divergence: how far each node's recent return has drifted away from
+// its sector-group mean, normalized by the group's stdev. Large
+// magnitude (>1.5) means the node is breaking from its cluster — likely
+// the most interesting signal for spotting invisible trends early.
+const DIVERG_LOOKBACK = 10
+const _divGroupMean = new Map()  // group -> recent mean
+const _divGroupStd = new Map()
+
+function _recentMeanReturn(node, c) {
+  const s = node.rawPrices
+  if (!s || s.length < 2) return 0
+  const end = Math.min(c, s.length - 1)
+  const start = Math.max(1, end - DIVERG_LOOKBACK + 1)
+  let sum = 0
+  let n = 0
+  for (let i = start; i <= end; i++) {
+    if (s[i - 1] > 0) { sum += Math.log(s[i] / s[i - 1]); n++ }
+  }
+  return n > 0 ? sum / n : 0
+}
+
+function computeDivergence(c) {
+  // Pass 1: recent mean return per node.
+  const recent = new Map()
+  for (const n of nodes) recent.set(n.symbol, _recentMeanReturn(n, c))
+  // Pass 2: group stats.
+  const byGroup = new Map()
+  for (const n of nodes) {
+    const g = n.group
+    if (!g) continue
+    if (!byGroup.has(g)) byGroup.set(g, [])
+    byGroup.get(g).push(recent.get(n.symbol))
+  }
+  _divGroupMean.clear()
+  _divGroupStd.clear()
+  for (const [g, arr] of byGroup) {
+    let m = 0
+    for (const v of arr) m += v
+    m /= arr.length
+    let sq = 0
+    for (const v of arr) sq += (v - m) * (v - m)
+    const std = Math.sqrt(sq / arr.length) || 1e-6
+    _divGroupMean.set(g, m)
+    _divGroupStd.set(g, std)
+  }
+  // Pass 3: divergence score per node.
+  for (const n of nodes) {
+    const m = _divGroupMean.get(n.group) ?? 0
+    const s = _divGroupStd.get(n.group) ?? 1
+    n.diverg = (recent.get(n.symbol) - m) / s
+  }
+}
+
+const _tmpColor = new THREE.Color()
+const _warmColor = new THREE.Color(0xff4040)
+const _coolColor = new THREE.Color(0x6fffb2)
+function applyDivergence() {
+  for (const n of nodes) {
+    const s = n.diverg || 0
+    const absS = Math.abs(s)
+    // Scale node a touch when it's breaking from its cluster.
+    const scale = 1 + Math.max(0, absS - 1) * 0.35
+    n.mesh.scale.setScalar(scale)
+    // Tint: positive divergence -> green (outperforming), negative -> red.
+    const intensity = Math.min(1, Math.max(0, (absS - 1.1) / 1.2))
+    if (intensity > 0) {
+      _tmpColor.setHex(n.baseColor ?? 0xffffff)
+      const target = s > 0 ? _coolColor : _warmColor
+      _tmpColor.lerp(target, intensity * 0.8)
+      n.mesh.material.color.copy(_tmpColor)
+    } else if (n.baseColor !== undefined) {
+      n.mesh.material.color.setHex(n.baseColor)
+    }
   }
 }
 
@@ -984,6 +1066,8 @@ function jumpCursor(next) {
     n.trailGeom.attributes.position.needsUpdate = true
   }
   updateEvents(c)
+  computeDivergence(c)
+  applyDivergence()
 }
 
 function animate(t) {
