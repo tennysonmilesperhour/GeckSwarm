@@ -1352,6 +1352,17 @@ async function fetchReal() {
       if (payload.source === 'stub' || !payload.prices) {
         reason = payload.fallback_reason || 'no-data'
         payload = null
+      } else if (Array.isArray(payload.tickers) && payload.tickers.length > 0) {
+        // Reject old-schema payloads (the legacy backend ships 50 tickers
+        // without `group` / `children`). The new viz needs the hierarchy
+        // metadata; fall back to the bundled stub instead of rendering
+        // a degenerate scene.
+        const sample = payload.tickers[0]
+        const newSchema = sample.group !== undefined && Array.isArray(sample.children)
+        if (!newSchema) {
+          reason = 'backend_schema_outdated'
+          payload = null
+        }
       }
     }
   } catch (e) {
