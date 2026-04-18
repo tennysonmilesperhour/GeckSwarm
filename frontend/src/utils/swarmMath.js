@@ -156,6 +156,70 @@ export function seriesStats(arr) {
   return { mean, std: Math.sqrt(v / n) || 1 }
 }
 
+// Sector-wheel layout: anchors at center, primaries arranged around a ring,
+// angular position driven by sector group. Groups are laid out clockwise
+// in a curated order so adjacent groups are conceptually related (tech
+// clusters, finance clusters, consumer clusters, etc.).
+//
+// Input: array of tickers with { symbol, tier, group }
+// Returns: map symbol -> [x, z]
+const SECTOR_WHEEL_ORDER = [
+  'tech-mega', 'semis', 'software', 'media',
+  'payments', 'banks', 'insurance', 'assetmgr',
+  'pharma', 'health-svc', 'medtech',
+  'discretionary', 'staples', 'tobacco',
+  'transport', 'industrials', 'materials', 'energy',
+  'telecom', 'utilities', 'reits',
+  'gold',
+]
+
+export function sectorWheelLayout(tickers, opts = {}) {
+  const anchorRadius = opts.anchorRadius ?? 10
+  const primaryRadius = opts.primaryRadius ?? 65
+  const out = new Map()
+
+  // Split into anchors + primaries, and bucket primaries by group.
+  const anchors = []
+  const groupBuckets = new Map() // group -> primaries[]
+  for (const t of tickers) {
+    if ((t.tier ?? 1) === 0) anchors.push(t)
+    else if ((t.tier ?? 1) === 1) {
+      if (!groupBuckets.has(t.group)) groupBuckets.set(t.group, [])
+      groupBuckets.get(t.group).push(t)
+    }
+  }
+
+  // Anchors: evenly spaced on a tiny inner ring.
+  const aN = Math.max(anchors.length, 1)
+  anchors.forEach((t, i) => {
+    const theta = (i / aN) * Math.PI * 2 - Math.PI / 2
+    out.set(t.symbol, [Math.cos(theta) * anchorRadius, Math.sin(theta) * anchorRadius])
+  })
+
+  // Primaries: each group gets an angular slice sized by its population.
+  const groups = SECTOR_WHEEL_ORDER.filter(g => groupBuckets.has(g))
+  const totalPrimaries = groups.reduce((a, g) => a + groupBuckets.get(g).length, 0)
+  const GAP = 0.015 // small angular gap between groups so clusters read apart
+  const totalGap = GAP * groups.length
+  let thetaStart = -Math.PI / 2 // top of the wheel = first group
+  for (const g of groups) {
+    const bucket = groupBuckets.get(g)
+    const slice = ((bucket.length / totalPrimaries) * (Math.PI * 2 - totalGap))
+    bucket.forEach((t, i) => {
+      // Center the group around its slice midpoint, spread members across it.
+      const within = bucket.length === 1 ? 0.5 : i / (bucket.length - 1)
+      const theta = thetaStart + within * slice
+      // Alternate radius slightly so overlapping ticker labels decongest.
+      const rJitter = (i % 2 === 0 ? 0 : 4)
+      const r = primaryRadius + rJitter
+      out.set(t.symbol, [Math.cos(theta) * r, Math.sin(theta) * r])
+    })
+    thetaStart += slice + GAP
+  }
+
+  return out
+}
+
 // 2D embedding of tickers from the correlation matrix: coords = eigenvector
 // scaled by sqrt(|eigenvalue|). Returns array of [x, z] pairs in the same
 // order as the input symbol list.

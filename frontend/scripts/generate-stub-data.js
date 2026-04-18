@@ -1,110 +1,37 @@
 #!/usr/bin/env node
-// Generate deterministic stub time-series for the stock-swarm viz.
-// Run: node frontend/scripts/generate-stub-data.js
+// Deterministic synthetic prices for the full 438-node stock-swarm
+// universe. Uses a factor model so correlations are plausible at scale:
 //
-// Each ticker's daily log-return is a weighted blend of its parents'
-// lagged log-returns plus idiosyncratic noise. Tier-1 anchors are pure
-// random walks. The hierarchy is intentionally visible in the data so
-// the correlation-graph derived in Task 4 should roughly recover it.
+//   daily_log_return[ticker] = sum( loading_k * factor_k_return )
+//                            + sum over declared parents( w * parent_return )
+//                            + idiosyncratic_noise
+//
+// Factors: MARKET, RATES, GOLD, plus one per sector group. Sector
+// loading is derived from the ticker's group in universe.js; children
+// inherit their strongest primary parent's group as their sector.
+// Parent blending (weighted from children.js) adds the explicit
+// ticker-level ties on top of the sector factor.
+//
+// Run: node frontend/scripts/generate-stub-data.js
 
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { ANCHORS, PRIMARIES } from '../src/data/universe.js'
+import { CHILDREN } from '../src/data/children.js'
+import { NODE_META, ALL_SYMBOLS, UNIVERSE_STATS } from '../src/data/hierarchy.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const OUT = resolve(__dirname, '../public/stock-swarm/stub.json')
 
 // ---------- Config ----------
 const SEED = 0xC0FFEE
-const DAYS = 504 // ~2 trading years
+const DAYS = 504
 const START_PRICE = 100
 const END_DATE = new Date('2026-04-17T00:00:00Z')
 
-// ---------- Ticker registry ----------
-// tier: 1 = macro anchor, higher = more downstream.
-// parents: list of [symbol, weight] influence links. Weights need not sum to 1;
-//   the generator normalizes the parent contribution per ticker.
-// vol: idiosyncratic daily stdev (log-return scale).
-// drift: annualized drift (log-return scale).
-const TICKERS = [
-  // Tier 1 — macro anchors
-  { s: 'SPY',   tier: 1, name: 'S&P 500 ETF',            parents: [],                                          vol: 0.010, drift: 0.09 },
-  { s: 'QQQ',   tier: 1, name: 'Nasdaq 100 ETF',         parents: [['SPY', 0.6]],                              vol: 0.012, drift: 0.13 },
-  { s: 'XLF',   tier: 1, name: 'Financials ETF',         parents: [['SPY', 0.5]],                              vol: 0.011, drift: 0.06 },
-  { s: 'TLT',   tier: 1, name: '20+yr Treasury ETF',     parents: [],                                          vol: 0.008, drift: -0.01 },
-
-  // Tier 2 — mega-cap leaders
-  { s: 'AAPL',  tier: 2, name: 'Apple',                  parents: [['QQQ', 0.55], ['SPY', 0.2]],               vol: 0.017, drift: 0.18 },
-  { s: 'MSFT',  tier: 2, name: 'Microsoft',              parents: [['QQQ', 0.55], ['SPY', 0.2]],               vol: 0.016, drift: 0.20 },
-  { s: 'GOOGL', tier: 2, name: 'Alphabet',               parents: [['QQQ', 0.55], ['SPY', 0.15]],              vol: 0.018, drift: 0.15 },
-  { s: 'AMZN',  tier: 2, name: 'Amazon',                 parents: [['QQQ', 0.55], ['SPY', 0.15]],              vol: 0.020, drift: 0.17 },
-  { s: 'META',  tier: 2, name: 'Meta Platforms',         parents: [['QQQ', 0.55], ['SPY', 0.1]],               vol: 0.023, drift: 0.20 },
-  { s: 'NVDA',  tier: 2, name: 'NVIDIA',                 parents: [['QQQ', 0.5],  ['SPY', 0.1]],               vol: 0.030, drift: 0.45 },
-  { s: 'TSLA',  tier: 2, name: 'Tesla',                  parents: [['QQQ', 0.4],  ['SPY', 0.1]],               vol: 0.035, drift: 0.10 },
-
-  // Tier 3 — semis, downstream of NVDA/AAPL
-  { s: 'TSM',   tier: 3, name: 'TSMC',                   parents: [['NVDA', 0.35], ['AAPL', 0.25], ['QQQ', 0.2]], vol: 0.022, drift: 0.18 },
-  { s: 'AVGO',  tier: 3, name: 'Broadcom',               parents: [['NVDA', 0.35], ['AAPL', 0.2],  ['QQQ', 0.2]], vol: 0.022, drift: 0.25 },
-  { s: 'AMD',   tier: 3, name: 'AMD',                    parents: [['NVDA', 0.55], ['QQQ', 0.2]],              vol: 0.030, drift: 0.20 },
-  { s: 'INTC',  tier: 3, name: 'Intel',                  parents: [['NVDA', 0.25], ['QQQ', 0.25]],             vol: 0.025, drift: -0.05 },
-  { s: 'MU',    tier: 3, name: 'Micron',                 parents: [['NVDA', 0.35], ['QQQ', 0.25]],             vol: 0.028, drift: 0.12 },
-  { s: 'QCOM',  tier: 3, name: 'Qualcomm',               parents: [['AAPL', 0.35], ['QQQ', 0.25]],             vol: 0.022, drift: 0.10 },
-  { s: 'ASML',  tier: 3, name: 'ASML',                   parents: [['NVDA', 0.3],  ['TSM', 0.3], ['QQQ', 0.2]], vol: 0.024, drift: 0.18 },
-
-  // Tier 4 — enterprise software, downstream of MSFT / GOOGL
-  { s: 'CRM',   tier: 4, name: 'Salesforce',             parents: [['MSFT', 0.35], ['QQQ', 0.25]],             vol: 0.021, drift: 0.12 },
-  { s: 'ORCL',  tier: 4, name: 'Oracle',                 parents: [['MSFT', 0.3],  ['QQQ', 0.25]],             vol: 0.019, drift: 0.15 },
-  { s: 'ADBE',  tier: 4, name: 'Adobe',                  parents: [['MSFT', 0.3],  ['GOOGL', 0.2], ['QQQ', 0.2]], vol: 0.021, drift: 0.10 },
-  { s: 'NOW',   tier: 4, name: 'ServiceNow',             parents: [['MSFT', 0.35], ['QQQ', 0.25]],             vol: 0.023, drift: 0.18 },
-
-  // Tier 5 — financials inside XLF
-  { s: 'JPM',   tier: 5, name: 'JPMorgan Chase',         parents: [['XLF', 0.55], ['SPY', 0.15], ['TLT', -0.15]], vol: 0.016, drift: 0.08 },
-  { s: 'BAC',   tier: 5, name: 'Bank of America',        parents: [['XLF', 0.6],  ['JPM', 0.2],  ['TLT', -0.15]], vol: 0.018, drift: 0.05 },
-  { s: 'WFC',   tier: 5, name: 'Wells Fargo',            parents: [['XLF', 0.55], ['JPM', 0.2],  ['TLT', -0.15]], vol: 0.018, drift: 0.05 },
-  { s: 'GS',    tier: 5, name: 'Goldman Sachs',          parents: [['XLF', 0.45], ['SPY', 0.2]],               vol: 0.020, drift: 0.10 },
-  { s: 'MS',    tier: 5, name: 'Morgan Stanley',         parents: [['XLF', 0.45], ['GS',  0.25]],              vol: 0.020, drift: 0.09 },
-  { s: 'C',     tier: 5, name: 'Citigroup',              parents: [['XLF', 0.55], ['JPM', 0.2],  ['TLT', -0.1]], vol: 0.020, drift: 0.04 },
-
-  // Tier 6 — energy producers (macro: SPY, loose tie to TLT-inverse)
-  { s: 'XOM',   tier: 6, name: 'Exxon Mobil',            parents: [['SPY', 0.25]],                             vol: 0.017, drift: 0.08 },
-  { s: 'CVX',   tier: 6, name: 'Chevron',                parents: [['SPY', 0.2],  ['XOM', 0.5]],               vol: 0.017, drift: 0.07 },
-  { s: 'COP',   tier: 6, name: 'ConocoPhillips',         parents: [['XOM', 0.5],  ['SPY', 0.2]],               vol: 0.020, drift: 0.10 },
-  { s: 'SLB',   tier: 6, name: 'Schlumberger',           parents: [['XOM', 0.4],  ['CVX', 0.3]],               vol: 0.022, drift: 0.05 },
-
-  // Tier 7 — transport, inversely sensitive to fuel (energy)
-  { s: 'UPS',   tier: 7, name: 'UPS',                    parents: [['SPY', 0.3],  ['XOM', -0.25]],             vol: 0.016, drift: 0.03 },
-  { s: 'FDX',   tier: 7, name: 'FedEx',                  parents: [['SPY', 0.3],  ['XOM', -0.25], ['UPS', 0.25]], vol: 0.018, drift: 0.04 },
-  { s: 'DAL',   tier: 7, name: 'Delta Air Lines',        parents: [['SPY', 0.25], ['XOM', -0.45]],             vol: 0.028, drift: 0.06 },
-  { s: 'UAL',   tier: 7, name: 'United Airlines',        parents: [['SPY', 0.25], ['XOM', -0.45], ['DAL', 0.35]], vol: 0.030, drift: 0.06 },
-
-  // Tier 8 — healthcare (largely macro)
-  { s: 'UNH',   tier: 8, name: 'UnitedHealth',           parents: [['SPY', 0.35]],                             vol: 0.014, drift: 0.08 },
-  { s: 'JNJ',   tier: 8, name: 'Johnson & Johnson',      parents: [['SPY', 0.3]],                              vol: 0.011, drift: 0.04 },
-  { s: 'LLY',   tier: 8, name: 'Eli Lilly',              parents: [['SPY', 0.25]],                             vol: 0.020, drift: 0.30 },
-  { s: 'PFE',   tier: 8, name: 'Pfizer',                 parents: [['SPY', 0.3],  ['JNJ', 0.2]],               vol: 0.015, drift: -0.02 },
-
-  // Tier 9 — consumer / retail
-  { s: 'WMT',   tier: 9, name: 'Walmart',                parents: [['SPY', 0.35]],                             vol: 0.013, drift: 0.12 },
-  { s: 'COST',  tier: 9, name: 'Costco',                 parents: [['SPY', 0.3],  ['WMT', 0.25]],              vol: 0.015, drift: 0.18 },
-  { s: 'HD',    tier: 9, name: 'Home Depot',             parents: [['SPY', 0.3],  ['TLT', 0.15]],              vol: 0.018, drift: 0.10 },
-  { s: 'TGT',   tier: 9, name: 'Target',                 parents: [['SPY', 0.3],  ['WMT', 0.35]],              vol: 0.022, drift: 0.04 },
-
-  // Tier 10 — payments duopoly
-  { s: 'V',     tier: 10, name: 'Visa',                  parents: [['SPY', 0.3],  ['QQQ', 0.2]],               vol: 0.014, drift: 0.12 },
-  { s: 'MA',    tier: 10, name: 'Mastercard',            parents: [['V', 0.7],    ['SPY', 0.15]],              vol: 0.015, drift: 0.13 },
-  { s: 'PYPL',  tier: 10, name: 'PayPal',                parents: [['V', 0.25],   ['QQQ', 0.3]],               vol: 0.025, drift: -0.05 },
-
-  // Tier 11 — gold (risk-off, inverse to rates & equities)
-  { s: 'GLD',   tier: 11, name: 'Gold ETF',              parents: [['SPY', -0.25], ['TLT', 0.2]],              vol: 0.012, drift: 0.08 },
-  { s: 'NEM',   tier: 11, name: 'Newmont',               parents: [['GLD', 0.65], ['SPY', -0.1]],              vol: 0.022, drift: 0.03 },
-  { s: 'GOLD',  tier: 11, name: 'Barrick Gold',          parents: [['GLD', 0.65], ['NEM', 0.2]],               vol: 0.024, drift: 0.02 },
-]
-
-if (TICKERS.length !== 50) {
-  throw new Error(`Expected 50 tickers, got ${TICKERS.length}`)
-}
-
-// ---------- Seeded RNG (mulberry32) ----------
+// ---------- Seeded RNG ----------
 function mulberry32(seed) {
   let a = seed >>> 0
   return () => {
@@ -116,7 +43,6 @@ function mulberry32(seed) {
   }
 }
 const rand = mulberry32(SEED)
-// Box-Muller standard normal
 function gauss() {
   let u = 0, v = 0
   while (u === 0) u = rand()
@@ -124,80 +50,264 @@ function gauss() {
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v)
 }
 
-// ---------- Date series (weekdays only, ending at END_DATE) ----------
+// ---------- Date series (weekdays, ending at END_DATE) ----------
 function buildDates(count, end) {
   const out = []
   const d = new Date(end)
   while (out.length < count) {
     const dow = d.getUTCDay()
-    if (dow !== 0 && dow !== 6) {
-      out.push(d.toISOString().slice(0, 10))
-    }
+    if (dow !== 0 && dow !== 6) out.push(d.toISOString().slice(0, 10))
     d.setUTCDate(d.getUTCDate() - 1)
   }
   return out.reverse()
 }
 
-// ---------- Generate returns tier-by-tier so parents exist first ----------
-// Topological order by tier, then by declaration order within tier
-const ordered = [...TICKERS].sort((a, b) => a.tier - b.tier)
+// ---------- Factor definitions (one per sector + macro) ----------
+// Maps a ticker's `group` to a sector factor name. Anchors get macro factors.
+const GROUP_TO_FACTOR = {
+  'anchor': null,             // anchors defined separately below
+  'tech-mega': 'TECH',
+  'semis': 'SEMIS',
+  'software': 'TECH',
+  'media': 'MEDIA',
+  'banks': 'FIN',
+  'insurance': 'FIN',
+  'payments': 'FIN',
+  'assetmgr': 'FIN',
+  'pharma': 'HEALTH',
+  'health-svc': 'HEALTH',
+  'medtech': 'HEALTH',
+  'energy': 'ENERGY',
+  'staples': 'STAPLES',
+  'discretionary': 'DISCR',
+  'transport': 'TRANSP',
+  'industrials': 'INDUST',
+  'materials': 'MATER',
+  'telecom': 'TELECOM',
+  'utilities': 'UTIL',
+  'reits': 'REIT',
+  'gold': 'GOLD',
+  'tobacco': 'STAPLES',
+}
 
-const logReturns = {}     // symbol -> array[DAYS] of log-returns
-const dailyDrift = d => d / 252
+const FACTOR_NAMES = [
+  'MARKET', 'RATES', 'GOLD',
+  'TECH', 'SEMIS', 'MEDIA',
+  'FIN', 'HEALTH', 'ENERGY', 'STAPLES', 'DISCR', 'TRANSP',
+  'INDUST', 'MATER', 'TELECOM', 'UTIL', 'REIT',
+]
 
-for (const t of ordered) {
+// Factor annualized vol (daily stdev after sqrt conversion). Market is the
+// broadest so a bit tighter; sector factors are higher to create sector
+// clustering; gold and rates have their own dynamics.
+const FACTOR_VOL_ANNUAL = {
+  MARKET:  0.14,  RATES:   0.08,  GOLD:    0.14,
+  TECH:    0.17,  SEMIS:   0.22,  MEDIA:   0.16,
+  FIN:     0.16,  HEALTH:  0.13,  ENERGY:  0.22,
+  STAPLES: 0.10,  DISCR:   0.15,  TRANSP:  0.17,
+  INDUST:  0.14,  MATER:   0.18,  TELECOM: 0.12,
+  UTIL:    0.11,  REIT:    0.14,
+}
+
+const FACTOR_DRIFT_ANNUAL = {
+  MARKET: 0.08,  RATES: -0.01, GOLD: 0.06,
+  TECH: 0.14, SEMIS: 0.22, MEDIA: 0.02,
+  FIN: 0.06, HEALTH: 0.07, ENERGY: 0.06, STAPLES: 0.04,
+  DISCR: 0.08, TRANSP: 0.04, INDUST: 0.06, MATER: 0.02,
+  TELECOM: 0.01, UTIL: 0.03, REIT: 0.02,
+}
+
+// Cross-factor couplings: sector factors are partially correlated with the
+// broad MARKET factor. Energy / Gold / Rates less so.
+const FACTOR_MARKET_BETA = {
+  MARKET: 0, RATES: -0.15, GOLD: -0.25,
+  TECH: 0.55, SEMIS: 0.50, MEDIA: 0.50,
+  FIN: 0.50, HEALTH: 0.35, ENERGY: 0.30, STAPLES: 0.30,
+  DISCR: 0.50, TRANSP: 0.45, INDUST: 0.45, MATER: 0.35,
+  TELECOM: 0.25, UTIL: 0.20, REIT: 0.35,
+}
+
+// ---------- Generate factor return series ----------
+const dailyFrom = annual => annual / 252
+const dailyVol = annual => annual / Math.sqrt(252)
+
+const factorReturns = {}
+// Step 1: generate "raw" factor returns as independent random walks.
+for (const f of FACTOR_NAMES) {
+  const vol = dailyVol(FACTOR_VOL_ANNUAL[f] ?? 0.12)
+  const mu = dailyFrom(FACTOR_DRIFT_ANNUAL[f] ?? 0.04)
   const r = new Array(DAYS)
-  const idioVol = t.vol
-  const mu = dailyDrift(t.drift)
-
-  // Normalize positive vs. negative parents separately so the *scale* of the
-  // influence blend stays bounded regardless of sign mix.
-  const parents = t.parents
-  let absSum = 0
-  for (const [, w] of parents) absSum += Math.abs(w)
-  const parentGain = absSum > 0 ? Math.min(0.9, absSum) / absSum : 0 // cap total parent influence
-
+  for (let i = 0; i < DAYS; i++) r[i] = mu + vol * gauss()
+  factorReturns[f] = r
+}
+// Step 2: infuse each non-MARKET factor with a MARKET beta so sectors move
+// with the broad market + their own sector idiosyncrasies.
+for (const f of FACTOR_NAMES) {
+  if (f === 'MARKET') continue
+  const beta = FACTOR_MARKET_BETA[f] ?? 0
   for (let i = 0; i < DAYS; i++) {
-    let parentComponent = 0
-    for (const [pSym, w] of parents) {
-      const pr = logReturns[pSym]
-      if (!pr) throw new Error(`parent ${pSym} missing for ${t.s}`)
-      parentComponent += w * parentGain * pr[i]
-    }
-    r[i] = mu + parentComponent + idioVol * gauss()
+    factorReturns[f][i] += beta * factorReturns.MARKET[i]
   }
-  logReturns[t.s] = r
+}
+
+// Step 3: intra-cluster coupling so sub-sectors correlate more tightly
+// with their sector peers than with the broad market alone (e.g. SEMIS
+// moves with TECH, ENERGY <-> TRANSP inverse via oil-cost channel).
+const CLUSTER_COUPLING = [
+  // [target, source, beta] — target += beta * source
+  ['SEMIS',  'TECH',   0.55],
+  ['MEDIA',  'TECH',   0.35],
+  ['DISCR',  'STAPLES', 0.20],
+  ['TRANSP', 'ENERGY', -0.35],
+  ['MATER',  'ENERGY', 0.25],
+  ['UTIL',   'RATES',   0.35],
+  ['REIT',   'RATES',   0.35],
+  ['TELECOM','RATES',   0.25],
+  ['GOLD',   'RATES',   0.20],
+  ['FIN',    'RATES',  -0.30],
+]
+for (const [target, source, beta] of CLUSTER_COUPLING) {
+  for (let i = 0; i < DAYS; i++) {
+    factorReturns[target][i] += beta * factorReturns[source][i]
+  }
+}
+
+// ---------- Per-symbol factor loadings + volatility ----------
+// Anchors: SPY = MARKET, QQQ = MARKET + TECH, GLD = GOLD, TLT = RATES
+// Primaries: their group factor + MARKET
+// Child-only: inherit primary's factor via parents; plus lighter MARKET
+function loadingsFor(sym) {
+  const node = NODE_META.get(sym)
+  if (!node) return { MARKET: 1 }
+
+  if (node.tier === 0) {
+    if (sym === 'SPY') return { MARKET: 1.0 }
+    if (sym === 'QQQ') return { MARKET: 0.7, TECH: 0.55 }
+    if (sym === 'GLD') return { GOLD: 1.0 }
+    if (sym === 'TLT') return { RATES: 1.0 }
+    return { MARKET: 1.0 }
+  }
+
+  const sector = GROUP_TO_FACTOR[node.group]
+  const L = { MARKET: 0.45 }
+  if (sector) L[sector] = (L[sector] ?? 0) + 0.55
+  if (node.tier === 2) {
+    // Child-only — soften MARKET exposure, let parent blending drive ties.
+    L.MARKET = 0.35
+    if (sector) L[sector] = 0.45
+  }
+  return L
+}
+
+// Idiosyncratic vol per tier — higher for smaller / newer names.
+function idioVol(sym) {
+  const node = NODE_META.get(sym)
+  if (!node) return 0.01
+  if (node.tier === 0) return 0.002
+  if (node.tier === 1) return 0.007
+  return 0.010
+}
+
+// ---------- Generate per-symbol log returns ----------
+// For primaries + anchors we can generate directly (factor model). For
+// child-only nodes, we additionally blend in the strongest-weighted
+// primary parent's return. That primary has already been computed.
+const logReturns = {}
+
+// Pass 1: anchors + primaries (factor-model only).
+for (const sym of ALL_SYMBOLS) {
+  const node = NODE_META.get(sym)
+  if (node.tier > 1) continue
+  const L = loadingsFor(sym)
+  const iv = idioVol(sym)
+  const r = new Array(DAYS)
+  for (let i = 0; i < DAYS; i++) {
+    let v = 0
+    for (const [f, w] of Object.entries(L)) v += w * factorReturns[f][i]
+    r[i] = v + iv * gauss()
+  }
+  logReturns[sym] = r
+}
+
+// Pass 2: child-only nodes. Blend factor component with the single strongest
+// parent relationship so the explicit ticker-level ties in children.js are
+// reflected in the correlation structure.
+for (const sym of ALL_SYMBOLS) {
+  const node = NODE_META.get(sym)
+  if (node.tier < 2) continue
+
+  // Strongest absolute-weight parent
+  let best = null
+  for (const p of node.parents) {
+    if (!best || Math.abs(p.weight) > Math.abs(best.weight)) best = p
+  }
+  const parentR = best && logReturns[best.symbol] ? logReturns[best.symbol] : null
+  const parentGain = best ? Math.max(-0.85, Math.min(0.85, best.weight * 0.9)) : 0
+
+  const L = loadingsFor(sym)
+  const iv = idioVol(sym)
+  // Scale down the factor loadings proportionally when we're using a parent,
+  // so total variance stays roughly bounded.
+  const factorScale = parentR ? 0.55 : 1.0
+
+  const r = new Array(DAYS)
+  for (let i = 0; i < DAYS; i++) {
+    let v = 0
+    for (const [f, w] of Object.entries(L)) v += factorScale * w * factorReturns[f][i]
+    if (parentR) v += parentGain * parentR[i]
+    r[i] = v + iv * gauss()
+  }
+  logReturns[sym] = r
 }
 
 // ---------- Integrate log-returns into prices ----------
 const prices = {}
-for (const t of TICKERS) {
+for (const sym of ALL_SYMBOLS) {
+  // Start prices in a plausible range so they look like real dollars. Base
+  // is derived from group so e.g. anchors sit around 400 and a random semi
+  // around 120.
+  const node = NODE_META.get(sym)
+  const startBias = node.tier === 0 ? 380 : (node.tier === 1 ? 140 : 65)
+  const jitter = 0.6 + rand() * 1.8
+  const startPrice = startBias * jitter
+
   const p = new Array(DAYS)
-  let logP = Math.log(START_PRICE)
-  const r = logReturns[t.s]
+  let logP = Math.log(startPrice)
+  const r = logReturns[sym]
   for (let i = 0; i < DAYS; i++) {
     logP += r[i]
     p[i] = +Math.exp(logP).toFixed(4)
   }
-  prices[t.s] = p
+  prices[sym] = p
 }
 
-// ---------- Write ----------
+// ---------- Emit tickers with hierarchy ----------
+const tickersOut = []
+for (const sym of ALL_SYMBOLS) {
+  const n = NODE_META.get(sym)
+  tickersOut.push({
+    symbol: sym,
+    name: n.name,
+    tier: n.tier,
+    group: n.group,
+    parents: n.parents.map(p => ({ symbol: p.symbol, relation: p.relation, weight: p.weight })),
+    children: n.children.map(c => ({ symbol: c.symbol, relation: c.relation, weight: c.weight })),
+  })
+}
+
 const payload = {
   generated_at: new Date().toISOString(),
   seed: SEED,
   days: DAYS,
   dates: buildDates(DAYS, END_DATE),
-  tickers: TICKERS.map(t => ({
-    symbol: t.s,
-    name: t.name,
-    tier: t.tier,
-    parents: t.parents.map(([s, w]) => ({ symbol: s, weight: w })),
-  })),
+  stats: UNIVERSE_STATS,
+  tickers: tickersOut,
   prices,
 }
 
 mkdirSync(dirname(OUT), { recursive: true })
 writeFileSync(OUT, JSON.stringify(payload))
 const bytes = JSON.stringify(payload).length
-console.log(`wrote ${OUT} (${TICKERS.length} tickers × ${DAYS} days, ${(bytes / 1024).toFixed(1)} KB)`)
+console.log(
+  `wrote ${OUT} (${ALL_SYMBOLS.length} tickers × ${DAYS} days, ${(bytes / 1024).toFixed(1)} KB)`
+)

@@ -6,11 +6,36 @@
       <div class="hud-sub">
         <span v-if="!loaded">loading…</span>
         <span v-else>
-          {{ tickerCount }} nodes · {{ currentDate }} ({{ cursor + 1 }}/{{ totalDays }})
+          {{ primaryCount }} primaries · {{ childCount }} substocks ·
+          {{ currentDate }} ({{ cursor + 1 }}/{{ totalDays }})
         </span>
       </div>
     </div>
     <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
+
+    <div
+      v-if="hovered"
+      class="ss-hover-panel"
+      :style="{ left: (hovered.x + 14) + 'px', top: (hovered.y - 10) + 'px' }"
+    >
+      <div class="ss-hover-row">
+        <span class="ss-hover-sym">{{ hovered.node.symbol }}</span>
+        <span class="ss-hover-tier">T{{ hovered.node.tier }}</span>
+      </div>
+      <div class="ss-hover-name">{{ hovered.node.name || '' }}</div>
+      <div class="ss-hover-price">${{ hoverPrice }}</div>
+      <div class="ss-hover-group">{{ hovered.node.group }}</div>
+      <div v-if="hovered.node.parentSym" class="ss-hover-parent">
+        orbits → {{ hovered.node.parentSym }}
+      </div>
+      <div
+        v-else-if="hovered.node.parents && hovered.node.parents.length"
+        class="ss-hover-parent"
+      >
+        influenced by →
+        {{ hovered.node.parents.slice(0, 3).map(p => p.symbol).join(', ') }}
+      </div>
+    </div>
 
     <div v-if="loadError" class="stock-swarm-error">{{ loadError }}</div>
 
@@ -101,18 +126,22 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
-import { ar1Fit, correlationEmbedding, leadLagMatrix, seriesStats } from '../utils/swarmMath.js'
+import { ar1Fit, sectorWheelLayout, seriesStats } from '../utils/swarmMath.js'
+import { NODE_META } from '../data/hierarchy.js'
 import { Delaunay } from 'd3-delaunay'
 
 const canvasRef = ref(null)
 const trackRef = ref(null)
 const labelLayerRef = ref(null)
+const hovered = ref(null) // { node, x, y }
 const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
 const cursor = ref(0)
 const totalDays = ref(0)
 const tickerCount = ref(0)
+const primaryCount = ref(0)
+const childCount = ref(0)
 const datesRef = ref([])
 const playing = ref(true)
 const playSpeed = ref(1.2)
@@ -220,11 +249,37 @@ const ROW_SPACING = 14
 const LAYOUT_SPAN = 140          // width/depth of the correlation embedding
 const LAYOUT_EASE = 0.04         // per-frame lerp toward target XZ (0..1)
 const Y_SCALE = 6               // visual amplitude per normalized stdev
-const BLANKET_SIZE = 200         // world units covered by the water surface
+const BLANKET_SIZE = 260         // world units covered by the water surface
 const BLANKET_SEGMENTS = 72      // per-axis plane subdivision
 const BLANKET_SIGMA = 13.0       // gaussian falloff in world units
 const BLANKET_Y_SCALE = 0.92     // how tall the blanket ripples relative to node Y
-const NODE_COUNT = 50            // hard-coded; matches the universe size
+const NODE_COUNT = 104           // anchors (4) + primaries (100) — tier 0 + tier 1
+const GROUP_COLORS = {
+  'anchor':        0xffffff,
+  'tech-mega':     0x6fd6ff,
+  'semis':         0xffb86c,
+  'software':      0x7dd3fc,
+  'media':         0xff79c6,
+  'banks':         0xffd166,
+  'insurance':     0xfde68a,
+  'payments':      0xfacc15,
+  'assetmgr':      0xe4a11b,
+  'pharma':        0x50fa7b,
+  'health-svc':    0x4ade80,
+  'medtech':       0x86efac,
+  'energy':        0xff5555,
+  'staples':       0xfca5a5,
+  'discretionary': 0xf472b6,
+  'transport':     0xffa24c,
+  'industrials':   0xa3a3a3,
+  'materials':     0xb45309,
+  'telecom':       0xa78bfa,
+  'utilities':     0x38bdf8,
+  'reits':         0x8be9fd,
+  'gold':          0xf1fa8c,
+  'tobacco':       0xc084fc,
+}
+// Keep TIER_COLORS around as a fallback (tier-2 substocks use a tier gray).
 const TIER_COLORS = {
   1: 0x6fd6ff, 2: 0xa0f0ff, 3: 0xffb86c, 4: 0xff79c6,
   5: 0xffd166, 6: 0xff5555, 7: 0xffa24c, 8: 0x50fa7b,
@@ -289,32 +344,40 @@ function buildScene(payload) {
   datesRef.value = payload.dates
   totalDays.value = payload.dates.length
   tickerCount.value = payload.tickers.length
+  primaryCount.value = payload.tickers.filter(t => (t.tier ?? 1) <= 1).length
+  childCount.value = payload.tickers.filter(t => (t.tier ?? 1) === 2).length
 
   const originX = -((GRID_COLS - 1) * COL_SPACING) / 2
   const originZ = -((GRID_ROWS - 1) * ROW_SPACING) / 2
 
-  // Compute correlation matrix once, then a 2D embedding via PCA.
-  const symbols = payload.tickers.map(t => t.symbol)
-  // Lead-lag similarity: for each pair we keep the max-|corr| over ±5-day
-  // shifts, sign preserved. Nodes that lead, follow, or inversely follow
-  // each other all end up near each other; strength governs distance.
-  const simMatrix = leadLagMatrix(symbols, payload.prices, 5)
-  const embedding = correlationEmbedding(simMatrix, LAYOUT_SPAN)
+  // Restrict the current render to tier 0 (anchors) + tier 1 (primaries)
+  // only — tier-2 children render in a later pass. Accept legacy stubs
+  // that predate tier=0/1/2 (treat undefined tier as tier 1).
+  const primaryTickers = payload.tickers.filter(t => (t.tier ?? 1) <= 1)
+
+  // Sector-wheel layout: anchors at center, primaries arranged around a
+  // ring, angular position driven by sector group. Conceptually related
+  // groups (semis next to tech-mega, banks next to insurance, etc.) are
+  // neighbors so the wheel reads as a sector map.
+  const symbols = primaryTickers.map(t => t.symbol)
+  const layout = sectorWheelLayout(primaryTickers, {
+    anchorRadius: 10, primaryRadius: Math.min(70, LAYOUT_SPAN * 0.48),
+  })
 
   // Market breadth per day: 2 * fraction-positive - 1, in [-1, +1].
   breadthSeries = computeBreadth(symbols, payload.prices, payload.dates.length)
 
-  payload.tickers.forEach((t, idx) => {
+  primaryTickers.forEach((t, idx) => {
     const col = idx % GRID_COLS
     const row = Math.floor(idx / GRID_COLS)
     const gridX = originX + col * COL_SPACING
     const gridZ = originZ + row * ROW_SPACING
-    const [targetX, targetZ] = embedding[idx]
+    const [targetX, targetZ] = layout.get(t.symbol) ?? [0, 0]
 
     const normSeries = normalizeZScore(payload.prices[t.symbol])
-    const color = TIER_COLORS[t.tier] ?? 0xffffff
-    // Tier scales node size: mega-caps and anchors read as "larger waves".
-    const size = 1.9 - Math.min(0.6, (t.tier - 1) * 0.04)
+    const color = GROUP_COLORS[t.group] ?? TIER_COLORS[t.tier] ?? 0xffffff
+    // Anchors bigger than primaries, primaries bigger than tier-2 children.
+    const size = t.tier === 0 ? 2.3 : (t.tier === 1 ? 1.7 : 1.0)
 
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(size, 16, 12),
@@ -350,16 +413,75 @@ function buildScene(payload) {
     scene.add(ghost)
 
     const node = {
-      symbol: t.symbol, tier: t.tier, mesh, trail, trailGeom,
+      symbol: t.symbol, tier: t.tier, name: t.name, group: t.group,
+      mesh, trail, trailGeom,
       trailPositions, normSeries, rawPrices,
       phi, drift, priceMean, priceStd,
       ghost,
       x: gridX, z: gridZ,
       targetX, targetZ,
+      parents: t.parents ?? [],
+      baseColor: color,
+      diverg: 0,
     }
     nodes.push(node)
     nodeBySymbol.set(t.symbol, node)
   })
+
+  // --- Tier-2 children: render as smaller dim orbital dots around their
+  // strongest-weighted primary parent. No trails / no labels / no ghosts
+  // (keeps DOM + draw cost bounded even at 330+ children).
+  const childTickers = payload.tickers.filter(t => (t.tier ?? 1) === 2)
+  const childOrbitRadius = 7.5
+  const childSize = 0.55
+  // Track how many children have been placed around each parent so orbit
+  // angles spread evenly.
+  const orbitCounts = new Map()
+  for (const t of childTickers) {
+    if (!payload.prices[t.symbol]) continue
+    // Find strongest-absolute-weight parent that we have laid out.
+    let parentSym = null
+    let parentW = 0
+    for (const p of (t.parents || [])) {
+      const parentNode = nodeBySymbol.get(p.symbol)
+      if (!parentNode) continue
+      if (Math.abs(p.weight) > Math.abs(parentW)) { parentSym = p.symbol; parentW = p.weight }
+    }
+    const parentNode = parentSym ? nodeBySymbol.get(parentSym) : null
+    if (!parentNode) continue
+
+    const orbitIdx = orbitCounts.get(parentSym) ?? 0
+    orbitCounts.set(parentSym, orbitIdx + 1)
+    // Spread up to 10 kids around the parent; beyond that wrap around.
+    const theta = (orbitIdx % 10) * (Math.PI * 2 / 10) + (orbitIdx >= 10 ? Math.PI / 10 : 0)
+    const orbitR = childOrbitRadius + (orbitIdx >= 10 ? 3 : 0)
+    const targetX = parentNode.targetX + Math.cos(theta) * orbitR
+    const targetZ = parentNode.targetZ + Math.sin(theta) * orbitR
+
+    const normSeries = normalizeZScore(payload.prices[t.symbol])
+    const color = GROUP_COLORS[parentNode.group] ?? GROUP_COLORS[t.group] ?? 0x9fd2ff
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(childSize, 10, 8),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.78, depthWrite: false }),
+    )
+    mesh.position.set(targetX, normSeries[0] * Y_SCALE, targetZ)
+    scene.add(mesh)
+    const rawPrices = payload.prices[t.symbol]
+    const node = {
+      symbol: t.symbol, tier: 2, name: t.name, group: parentNode.group,
+      mesh, trail: null, trailGeom: null, trailPositions: null,
+      ghost: null,
+      normSeries, rawPrices,
+      phi: 0, drift: 0, priceMean: rawPrices[0], priceStd: 1,
+      x: targetX, z: targetZ, targetX, targetZ,
+      parentSym,
+      parents: t.parents ?? [],
+      baseColor: color,
+      diverg: 0,
+    }
+    nodes.push(node)
+    nodeBySymbol.set(t.symbol, node)
+  }
 }
 
 function predictY(node, c, H) {
@@ -380,10 +502,8 @@ function updateGhosts(c) {
   const visible = predict.value
   const H = horizon.value
   for (const n of nodes) {
-    if (!visible) {
-      if (n.ghost.visible) n.ghost.visible = false
-      continue
-    }
+    if (!n.ghost) continue
+    if (!visible) { if (n.ghost.visible) n.ghost.visible = false; continue }
     n.ghost.visible = true
     n.ghost.position.set(n.x, predictY(n, c, H), n.z + 2.2)
   }
@@ -519,11 +639,99 @@ function disposeBlanket() {
 function updateBlanket(elapsed) {
   if (!blanket) return
   const vecs = blanket.nodeVecs
-  for (let i = 0; i < nodes.length && i < NODE_COUNT; i++) {
-    const n = nodes[i]
+  const primariesOnly = nodes.filter(n => (n.tier ?? 1) <= 1)
+  const cap = Math.min(primariesOnly.length, NODE_COUNT)
+  for (let i = 0; i < cap; i++) {
+    const n = primariesOnly[i]
     vecs[i].set(n.x, n.mesh.position.y, n.z)
   }
+  // zero-out the remainder so leftover slots don't deform the surface
+  for (let i = cap; i < NODE_COUNT; i++) vecs[i].set(0, -999, 0)
   blanket.uniforms.uTime.value = elapsed
+}
+
+// Directional flow particles: animated dots that travel along each
+// declared parent -> child edge, giving a sense of influence/energy
+// propagating down the DAG. Speed scales with the declared weight.
+let flow = null  // { points, positions, geom, mat, edges: [{from, to, t, speed}] }
+const FLOW_PARTICLES_PER_EDGE = 3
+const FLOW_SPEED_BASE = 0.18  // base progress per second (|weight|=0.5 -> full speed)
+
+function buildFlow() {
+  disposeFlow()
+  const edges = []
+  for (const n of nodes) {
+    if (n.tier !== 2 || !n.parentSym) continue
+    const parent = nodeBySymbol.get(n.parentSym)
+    if (!parent) continue
+    // Lookup the weight from the parent's children list.
+    const primaryParent = parent
+    const primaryNode = NODE_META?.get?.(primaryParent.symbol) ?? null
+    let weight = 0.5
+    if (primaryNode) {
+      for (const c of (primaryNode.children || [])) {
+        if (c.symbol === n.symbol) { weight = c.weight; break }
+      }
+    }
+    // Spawn FLOW_PARTICLES_PER_EDGE particles along this edge at offset t.
+    for (let k = 0; k < FLOW_PARTICLES_PER_EDGE; k++) {
+      edges.push({
+        from: parent, to: n,
+        t: k / FLOW_PARTICLES_PER_EDGE,
+        speed: Math.max(0.1, Math.abs(weight)) * FLOW_SPEED_BASE,
+      })
+    }
+  }
+  if (!edges.length) return
+  const positions = new Float32Array(edges.length * 3)
+  const colors = new Float32Array(edges.length * 3)
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  const mat = new THREE.PointsMaterial({
+    size: 1.1, vertexColors: true, transparent: true,
+    opacity: 0.88, depthWrite: false, sizeAttenuation: true,
+  })
+  const points = new THREE.Points(geom, mat)
+  scene.add(points)
+  flow = { points, positions, colors, geom, mat, edges }
+}
+
+function disposeFlow() {
+  if (!flow) return
+  scene.remove(flow.points)
+  flow.geom.dispose()
+  flow.mat.dispose()
+  flow = null
+}
+
+function updateFlow(dt) {
+  if (!flow) return
+  const { edges, positions, colors } = flow
+  for (let i = 0; i < edges.length; i++) {
+    const e = edges[i]
+    e.t += e.speed * dt
+    if (e.t > 1) e.t -= 1
+    const fx = e.from.x, fz = e.from.z, fy = e.from.mesh.position.y
+    const tx = e.to.x,   tz = e.to.z,   ty = e.to.mesh.position.y
+    const p = i * 3
+    const u = e.t
+    positions[p]     = fx + (tx - fx) * u
+    positions[p + 1] = fy + (ty - fy) * u + 0.3 // lift a hair so particles ride above lines
+    positions[p + 2] = fz + (tz - fz) * u
+    // Color tint: use the child's group color, brighter at higher t so
+    // particles fade from parent to child in their own glow.
+    const groupColor = GROUP_COLORS[e.to.group] ?? 0xa8e4ff
+    const r = ((groupColor >> 16) & 0xff) / 255
+    const g = ((groupColor >> 8) & 0xff) / 255
+    const b = (groupColor & 0xff) / 255
+    const fade = 0.55 + 0.45 * u
+    colors[p]     = r * fade
+    colors[p + 1] = g * fade
+    colors[p + 2] = b * fade
+  }
+  flow.geom.attributes.position.needsUpdate = true
+  flow.geom.attributes.color.needsUpdate = true
 }
 
 // Delaunay triangulation of the target-XZ positions gives each node its
@@ -532,29 +740,50 @@ function updateBlanket(elapsed) {
 function buildEdges() {
   disposeEdges()
   if (nodes.length < 3) return
-  const pts = new Float64Array(nodes.length * 2)
+  // Two edge sources:
+  //   1. Delaunay triangulation over anchors + primaries only (tier <= 1)
+  //      so the outer ring reads as a clean sector grid.
+  //   2. Declared parent-child edges for tier-2 kids -> primary parent
+  //      so each child orbit also shows a thin spoke to its hub.
+  const primaryIdx = []
   for (let i = 0; i < nodes.length; i++) {
-    pts[i * 2] = nodes[i].targetX
-    pts[i * 2 + 1] = nodes[i].targetZ
+    if ((nodes[i].tier ?? 1) <= 1) primaryIdx.push(i)
   }
+  const pts = new Float64Array(primaryIdx.length * 2)
+  primaryIdx.forEach((ni, j) => {
+    pts[j * 2] = nodes[ni].targetX
+    pts[j * 2 + 1] = nodes[ni].targetZ
+  })
   const delaunay = new Delaunay(pts)
   const seen = new Set()
   edgePairs = []
   const tri = delaunay.triangles
   for (let k = 0; k < tri.length; k += 3) {
-    const a = tri[k], b = tri[k + 1], c = tri[k + 2]
+    const a = primaryIdx[tri[k]], b = primaryIdx[tri[k + 1]], c = primaryIdx[tri[k + 2]]
     for (const [u, v] of [[a, b], [b, c], [c, a]]) {
       const lo = Math.min(u, v), hi = Math.max(u, v)
-      const key = lo * 1024 + hi
+      const key = lo * 8192 + hi
       if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
     }
+  }
+  // Child -> primary spokes
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i]
+    if (n.tier !== 2 || !n.parentSym) continue
+    const parent = nodeBySymbol.get(n.parentSym)
+    if (!parent) continue
+    const pi = nodes.indexOf(parent)
+    if (pi < 0) continue
+    const lo = Math.min(i, pi), hi = Math.max(i, pi)
+    const key = lo * 8192 + hi
+    if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
   }
 
   const positions = new Float32Array(edgePairs.length * 2 * 3)
   const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   const mat = new THREE.LineBasicMaterial({
-    color: 0xffffff, transparent: true, opacity: 0.28, depthWrite: false,
+    color: 0xffffff, transparent: true, opacity: 0.22, depthWrite: false,
   })
   edgeMesh = new THREE.LineSegments(geom, mat)
   scene.add(edgeMesh)
@@ -594,6 +823,9 @@ function buildLabels() {
   const layer = labelLayerRef.value
   if (!layer) return
   for (const n of nodes) {
+    // Skip labels for tier-2 children to keep the DOM and per-frame work
+    // bounded; their identity is implied by orbiting their labeled parent.
+    if (n.tier === 2) { n.labelEl = null; continue }
     const el = document.createElement('div')
     el.className = 'ss-label'
     el.textContent = n.symbol
@@ -720,6 +952,7 @@ function applySmoothCursor() {
   for (const n of nodes) {
     const y = sampleY(n.normSeries, cf) * Y_SCALE
     n.mesh.position.y = y
+    if (!n.trailPositions) continue // tier-2 children don't get trails
     const p = n.trailPositions
     const last = (TRAIL_LEN - 1) * 3
     if (crossed) {
@@ -734,6 +967,84 @@ function applySmoothCursor() {
     lastBarIdx = c
     cursor.value = c
     updateEvents(c)
+    computeDivergence(c)
+  }
+  applyDivergence()
+}
+
+// Divergence: how far each node's recent return has drifted away from
+// its sector-group mean, normalized by the group's stdev. Large
+// magnitude (>1.5) means the node is breaking from its cluster — likely
+// the most interesting signal for spotting invisible trends early.
+const DIVERG_LOOKBACK = 10
+const _divGroupMean = new Map()  // group -> recent mean
+const _divGroupStd = new Map()
+
+function _recentMeanReturn(node, c) {
+  const s = node.rawPrices
+  if (!s || s.length < 2) return 0
+  const end = Math.min(c, s.length - 1)
+  const start = Math.max(1, end - DIVERG_LOOKBACK + 1)
+  let sum = 0
+  let n = 0
+  for (let i = start; i <= end; i++) {
+    if (s[i - 1] > 0) { sum += Math.log(s[i] / s[i - 1]); n++ }
+  }
+  return n > 0 ? sum / n : 0
+}
+
+function computeDivergence(c) {
+  // Pass 1: recent mean return per node.
+  const recent = new Map()
+  for (const n of nodes) recent.set(n.symbol, _recentMeanReturn(n, c))
+  // Pass 2: group stats.
+  const byGroup = new Map()
+  for (const n of nodes) {
+    const g = n.group
+    if (!g) continue
+    if (!byGroup.has(g)) byGroup.set(g, [])
+    byGroup.get(g).push(recent.get(n.symbol))
+  }
+  _divGroupMean.clear()
+  _divGroupStd.clear()
+  for (const [g, arr] of byGroup) {
+    let m = 0
+    for (const v of arr) m += v
+    m /= arr.length
+    let sq = 0
+    for (const v of arr) sq += (v - m) * (v - m)
+    const std = Math.sqrt(sq / arr.length) || 1e-6
+    _divGroupMean.set(g, m)
+    _divGroupStd.set(g, std)
+  }
+  // Pass 3: divergence score per node.
+  for (const n of nodes) {
+    const m = _divGroupMean.get(n.group) ?? 0
+    const s = _divGroupStd.get(n.group) ?? 1
+    n.diverg = (recent.get(n.symbol) - m) / s
+  }
+}
+
+const _tmpColor = new THREE.Color()
+const _warmColor = new THREE.Color(0xff4040)
+const _coolColor = new THREE.Color(0x6fffb2)
+function applyDivergence() {
+  for (const n of nodes) {
+    const s = n.diverg || 0
+    const absS = Math.abs(s)
+    // Scale node a touch when it's breaking from its cluster.
+    const scale = 1 + Math.max(0, absS - 1) * 0.35
+    n.mesh.scale.setScalar(scale)
+    // Tint: positive divergence -> green (outperforming), negative -> red.
+    const intensity = Math.min(1, Math.max(0, (absS - 1.1) / 1.2))
+    if (intensity > 0) {
+      _tmpColor.setHex(n.baseColor ?? 0xffffff)
+      const target = s > 0 ? _coolColor : _warmColor
+      _tmpColor.lerp(target, intensity * 0.8)
+      n.mesh.material.color.copy(_tmpColor)
+    } else if (n.baseColor !== undefined) {
+      n.mesh.material.color.setHex(n.baseColor)
+    }
   }
 }
 
@@ -748,6 +1059,7 @@ function jumpCursor(next) {
   for (const n of nodes) {
     const y = n.normSeries[c] * Y_SCALE
     n.mesh.position.y = y
+    if (!n.trailPositions) continue // tier-2 children don't get trails
     const p = n.trailPositions
     for (let i = 0; i < TRAIL_LEN; i++) {
       const srcIdx = Math.max(0, c - (TRAIL_LEN - 1 - i))
@@ -759,6 +1071,8 @@ function jumpCursor(next) {
     n.trailGeom.attributes.position.needsUpdate = true
   }
   updateEvents(c)
+  computeDivergence(c)
+  applyDivergence()
 }
 
 function animate(t) {
@@ -780,13 +1094,14 @@ function animate(t) {
   if (loaded.value) applySmoothCursor()
   updateEdges()
   updateBlanket(t * 0.001)
+  updateFlow(dt)
   updateWind(cursor.value)
   if (predict.value) updateGhosts(cursor.value)
   if (loaded.value) updateLabels()
 
   // Slow camera yaw for god's-eye feel
-  const camR = 110
-  const camY = 55
+  const camR = 160
+  const camY = 78
   const theta = t * 0.00006
   camera.position.x = Math.sin(theta) * camR
   camera.position.z = Math.cos(theta) * camR
@@ -832,10 +1147,10 @@ async function fetchReal() {
 
 function clearScene() {
   for (const n of nodes) {
-    scene.remove(n.mesh); scene.remove(n.trail); scene.remove(n.ghost)
+    scene.remove(n.mesh)
     n.mesh.geometry.dispose(); n.mesh.material.dispose()
-    n.trailGeom.dispose(); n.trail.material.dispose()
-    n.ghost.geometry.dispose(); n.ghost.material.dispose()
+    if (n.trail)  { scene.remove(n.trail); n.trailGeom.dispose(); n.trail.material.dispose() }
+    if (n.ghost)  { scene.remove(n.ghost); n.ghost.geometry.dispose(); n.ghost.material.dispose() }
   }
   nodes = []
   nodeBySymbol = new Map()
@@ -850,6 +1165,7 @@ function clearScene() {
   disposeWindField()
   disposeBlanket()
   disposeEdges()
+  disposeFlow()
   disposeLabels()
   breadthSeries = null
 }
@@ -879,6 +1195,7 @@ async function loadData() {
     buildWindField()
     buildEvents(eventsJson, payload.dates)
     buildLabels()
+    buildFlow()
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
     cursorF = 0
@@ -893,6 +1210,44 @@ function reload() {
   loadData()
 }
 
+// Hover raycaster. Throttled to pointer move events only.
+const raycaster = new THREE.Raycaster()
+const ndcVec = new THREE.Vector2()
+let lastHoverMeshes = []
+function onPointerMove(evt) {
+  if (!renderer || !camera || !nodes.length) return
+  const canvas = renderer.domElement
+  const rect = canvas.getBoundingClientRect()
+  ndcVec.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1
+  ndcVec.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1
+  raycaster.setFromCamera(ndcVec, camera)
+  // Re-cache mesh list only when node count changes.
+  if (lastHoverMeshes.length !== nodes.length) {
+    lastHoverMeshes = nodes.map(n => n.mesh)
+  }
+  const hits = raycaster.intersectObjects(lastHoverMeshes, false)
+  if (hits.length) {
+    const hit = hits[0]
+    const node = nodes.find(n => n.mesh === hit.object)
+    if (node) {
+      hovered.value = { node, x: evt.clientX, y: evt.clientY }
+      return
+    }
+  }
+  hovered.value = null
+}
+function onPointerLeave() { hovered.value = null }
+
+// Helper to format the live price under the hover panel.
+const hoverPrice = computed(() => {
+  const h = hovered.value
+  if (!h) return ''
+  const c = Math.max(0, Math.min(totalDays.value - 1, Math.floor(cursorF)))
+  const p = h.node.rawPrices?.[c]
+  if (p == null) return ''
+  return p >= 1000 ? p.toFixed(0) : p.toFixed(2)
+})
+
 onMounted(async () => {
   const canvas = canvasRef.value
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true })
@@ -900,7 +1255,7 @@ onMounted(async () => {
   renderer.setClearColor(0x000000, 1)
 
   scene = new THREE.Scene()
-  scene.fog = new THREE.Fog(0x000000, 140, 260)
+  scene.fog = new THREE.Fog(0x000000, 200, 360)
   camera = new THREE.PerspectiveCamera(52, 1, 0.1, 2000)
   camera.position.set(0, 52, 115)
   camera.lookAt(0, 0, 0)
@@ -910,6 +1265,8 @@ onMounted(async () => {
   resizeObserver.observe(canvas.parentElement)
 
   window.addEventListener('keydown', onKeydown)
+  canvas.addEventListener('pointermove', onPointerMove)
+  canvas.addEventListener('pointerleave', onPointerLeave)
 
   await loadData()
   animate(0)
@@ -956,6 +1313,29 @@ onBeforeUnmount(() => {
   opacity: 0.7;
   margin-top: 2px;
 }
+.ss-hover-panel {
+  position: fixed;
+  min-width: 180px;
+  padding: 8px 10px 9px;
+  background: rgba(5, 8, 15, 0.94);
+  border: 1px solid rgba(57, 255, 20, 0.35);
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.3;
+  pointer-events: none;
+  z-index: 1000;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(6px);
+}
+.ss-hover-row { display: flex; justify-content: space-between; align-items: center; }
+.ss-hover-sym { font-size: 13px; font-weight: 800; letter-spacing: 0.1em; color: #39ff14; }
+.ss-hover-tier { font-size: 9px; opacity: 0.55; letter-spacing: 0.1em; }
+.ss-hover-name { opacity: 0.8; margin-top: 1px; font-size: 10px; }
+.ss-hover-price { color: #fde68a; font-weight: 700; font-size: 14px; margin: 3px 0; }
+.ss-hover-group { opacity: 0.55; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; }
+.ss-hover-parent { opacity: 0.7; font-size: 10px; margin-top: 4px; color: #a8e4ff; }
 .stock-swarm-labels {
   position: absolute;
   inset: 0;
