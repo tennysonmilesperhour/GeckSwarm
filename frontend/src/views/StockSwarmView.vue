@@ -102,6 +102,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import * as THREE from 'three'
 import { ar1Fit, sectorWheelLayout, seriesStats } from '../utils/swarmMath.js'
+import { NODE_META } from '../data/hierarchy.js'
 import { Delaunay } from 'd3-delaunay'
 
 const canvasRef = ref(null)
@@ -602,11 +603,99 @@ function disposeBlanket() {
 function updateBlanket(elapsed) {
   if (!blanket) return
   const vecs = blanket.nodeVecs
-  for (let i = 0; i < nodes.length && i < NODE_COUNT; i++) {
-    const n = nodes[i]
+  const primariesOnly = nodes.filter(n => (n.tier ?? 1) <= 1)
+  const cap = Math.min(primariesOnly.length, NODE_COUNT)
+  for (let i = 0; i < cap; i++) {
+    const n = primariesOnly[i]
     vecs[i].set(n.x, n.mesh.position.y, n.z)
   }
+  // zero-out the remainder so leftover slots don't deform the surface
+  for (let i = cap; i < NODE_COUNT; i++) vecs[i].set(0, -999, 0)
   blanket.uniforms.uTime.value = elapsed
+}
+
+// Directional flow particles: animated dots that travel along each
+// declared parent -> child edge, giving a sense of influence/energy
+// propagating down the DAG. Speed scales with the declared weight.
+let flow = null  // { points, positions, geom, mat, edges: [{from, to, t, speed}] }
+const FLOW_PARTICLES_PER_EDGE = 3
+const FLOW_SPEED_BASE = 0.18  // base progress per second (|weight|=0.5 -> full speed)
+
+function buildFlow() {
+  disposeFlow()
+  const edges = []
+  for (const n of nodes) {
+    if (n.tier !== 2 || !n.parentSym) continue
+    const parent = nodeBySymbol.get(n.parentSym)
+    if (!parent) continue
+    // Lookup the weight from the parent's children list.
+    const primaryParent = parent
+    const primaryNode = NODE_META?.get?.(primaryParent.symbol) ?? null
+    let weight = 0.5
+    if (primaryNode) {
+      for (const c of (primaryNode.children || [])) {
+        if (c.symbol === n.symbol) { weight = c.weight; break }
+      }
+    }
+    // Spawn FLOW_PARTICLES_PER_EDGE particles along this edge at offset t.
+    for (let k = 0; k < FLOW_PARTICLES_PER_EDGE; k++) {
+      edges.push({
+        from: parent, to: n,
+        t: k / FLOW_PARTICLES_PER_EDGE,
+        speed: Math.max(0.1, Math.abs(weight)) * FLOW_SPEED_BASE,
+      })
+    }
+  }
+  if (!edges.length) return
+  const positions = new Float32Array(edges.length * 3)
+  const colors = new Float32Array(edges.length * 3)
+  const geom = new THREE.BufferGeometry()
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  const mat = new THREE.PointsMaterial({
+    size: 1.1, vertexColors: true, transparent: true,
+    opacity: 0.88, depthWrite: false, sizeAttenuation: true,
+  })
+  const points = new THREE.Points(geom, mat)
+  scene.add(points)
+  flow = { points, positions, colors, geom, mat, edges }
+}
+
+function disposeFlow() {
+  if (!flow) return
+  scene.remove(flow.points)
+  flow.geom.dispose()
+  flow.mat.dispose()
+  flow = null
+}
+
+function updateFlow(dt) {
+  if (!flow) return
+  const { edges, positions, colors } = flow
+  for (let i = 0; i < edges.length; i++) {
+    const e = edges[i]
+    e.t += e.speed * dt
+    if (e.t > 1) e.t -= 1
+    const fx = e.from.x, fz = e.from.z, fy = e.from.mesh.position.y
+    const tx = e.to.x,   tz = e.to.z,   ty = e.to.mesh.position.y
+    const p = i * 3
+    const u = e.t
+    positions[p]     = fx + (tx - fx) * u
+    positions[p + 1] = fy + (ty - fy) * u + 0.3 // lift a hair so particles ride above lines
+    positions[p + 2] = fz + (tz - fz) * u
+    // Color tint: use the child's group color, brighter at higher t so
+    // particles fade from parent to child in their own glow.
+    const groupColor = GROUP_COLORS[e.to.group] ?? 0xa8e4ff
+    const r = ((groupColor >> 16) & 0xff) / 255
+    const g = ((groupColor >> 8) & 0xff) / 255
+    const b = (groupColor & 0xff) / 255
+    const fade = 0.55 + 0.45 * u
+    colors[p]     = r * fade
+    colors[p + 1] = g * fade
+    colors[p + 2] = b * fade
+  }
+  flow.geom.attributes.position.needsUpdate = true
+  flow.geom.attributes.color.needsUpdate = true
 }
 
 // Delaunay triangulation of the target-XZ positions gives each node its
@@ -889,6 +978,7 @@ function animate(t) {
   if (loaded.value) applySmoothCursor()
   updateEdges()
   updateBlanket(t * 0.001)
+  updateFlow(dt)
   updateWind(cursor.value)
   if (predict.value) updateGhosts(cursor.value)
   if (loaded.value) updateLabels()
@@ -959,6 +1049,7 @@ function clearScene() {
   disposeWindField()
   disposeBlanket()
   disposeEdges()
+  disposeFlow()
   disposeLabels()
   breadthSeries = null
 }
@@ -988,6 +1079,7 @@ async function loadData() {
     buildWindField()
     buildEvents(eventsJson, payload.dates)
     buildLabels()
+    buildFlow()
     sourceLabel.value = payload.source || source.value
     cursor.value = 0
     cursorF = 0
