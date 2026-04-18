@@ -11,6 +11,40 @@
         </span>
       </div>
     </div>
+    <div
+      v-if="loaded && (divergLeaders.up.length || divergLeaders.down.length)"
+      class="ss-leader"
+    >
+      <div class="ss-leader-title">cluster divergence</div>
+      <div class="ss-leader-cols">
+        <div class="ss-leader-col">
+          <div class="ss-leader-head ss-up">▲ outperforming</div>
+          <div v-for="row in divergLeaders.up" :key="row.symbol" class="ss-leader-row ss-up">
+            <span class="ss-leader-sym">{{ row.symbol }}</span>
+            <span class="ss-leader-val">+{{ row.diverg.toFixed(2) }}σ</span>
+          </div>
+        </div>
+        <div class="ss-leader-col">
+          <div class="ss-leader-head ss-down">▼ lagging</div>
+          <div v-for="row in divergLeaders.down" :key="row.symbol" class="ss-leader-row ss-down">
+            <span class="ss-leader-sym">{{ row.symbol }}</span>
+            <span class="ss-leader-val">{{ row.diverg.toFixed(2) }}σ</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div v-if="loaded" class="ss-legend">
+      <div class="ss-legend-title">edges</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#72bfff" /> supplier</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#ffb44d" /> customer</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#ff5959" /> rival</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#72ff8d" /> partner</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#66ffe4" /> ecosystem</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#c28cff" /> holding</div>
+      <div class="ss-legend-row"><span class="ss-swatch" style="background:#bcbcc2" /> peer</div>
+    </div>
+
     <div ref="labelLayerRef" class="stock-swarm-labels" aria-hidden="true" />
 
     <div
@@ -134,6 +168,7 @@ const canvasRef = ref(null)
 const trackRef = ref(null)
 const labelLayerRef = ref(null)
 const hovered = ref(null) // { node, x, y }
+const focused = ref(null) // symbol of focused primary; null = no focus
 const hoverPct = ref(-1)
 const loaded = ref(false)
 const loadError = ref('')
@@ -142,6 +177,7 @@ const totalDays = ref(0)
 const tickerCount = ref(0)
 const primaryCount = ref(0)
 const childCount = ref(0)
+const divergLeaders = ref({ up: [], down: [] })
 const datesRef = ref([])
 const playing = ref(true)
 const playSpeed = ref(1.2)
@@ -381,7 +417,7 @@ function buildScene(payload) {
 
     const mesh = new THREE.Mesh(
       new THREE.SphereGeometry(size, 16, 12),
-      new THREE.MeshBasicMaterial({ color })
+      new THREE.MeshBasicMaterial({ color, transparent: true })
     )
     mesh.position.set(gridX, normSeries[0] * Y_SCALE, gridZ)
     scene.add(mesh)
@@ -737,14 +773,22 @@ function updateFlow(dt) {
 // Delaunay triangulation of the target-XZ positions gives each node its
 // natural planar neighbors — denser where nodes cluster, sparser at the
 // edges, and always providing 360° coverage around each node.
+// Relation -> edge color. Delaunay peer edges and unclassified stay white.
+const RELATION_COLORS = {
+  supplier:   [0.45, 0.75, 1.00],  // sky blue - upstream input
+  customer:   [1.00, 0.70, 0.30],  // amber    - downstream buyer
+  rival:      [1.00, 0.35, 0.35],  // red      - direct competitor
+  peer:       [0.75, 0.75, 0.78],  // neutral gray
+  ecosystem:  [0.40, 1.00, 0.90],  // cyan     - platform tie
+  partner:    [0.45, 1.00, 0.55],  // green    - strategic partner
+  holding:    [0.80, 0.55, 1.00],  // purple   - investment position
+  downstream: [0.45, 0.90, 0.80],  // teal     - downstream revenue
+}
+const DEFAULT_EDGE_COLOR = [0.90, 0.90, 0.95]
+
 function buildEdges() {
   disposeEdges()
   if (nodes.length < 3) return
-  // Two edge sources:
-  //   1. Delaunay triangulation over anchors + primaries only (tier <= 1)
-  //      so the outer ring reads as a clean sector grid.
-  //   2. Declared parent-child edges for tier-2 kids -> primary parent
-  //      so each child orbit also shows a thin spoke to its hub.
   const primaryIdx = []
   for (let i = 0; i < nodes.length; i++) {
     if ((nodes[i].tier ?? 1) <= 1) primaryIdx.push(i)
@@ -757,16 +801,27 @@ function buildEdges() {
   const delaunay = new Delaunay(pts)
   const seen = new Set()
   edgePairs = []
+  const edgeRelations = []
   const tri = delaunay.triangles
   for (let k = 0; k < tri.length; k += 3) {
     const a = primaryIdx[tri[k]], b = primaryIdx[tri[k + 1]], c = primaryIdx[tri[k + 2]]
     for (const [u, v] of [[a, b], [b, c], [c, a]]) {
       const lo = Math.min(u, v), hi = Math.max(u, v)
       const key = lo * 8192 + hi
-      if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
+      if (!seen.has(key)) {
+        seen.add(key)
+        edgePairs.push([lo, hi])
+        // Primary-primary edges: lookup declared relation if the pair appears
+        // in either side's parents list; otherwise treat as a Delaunay peer.
+        const na = nodes[lo], nb = nodes[hi]
+        let rel = null
+        for (const p of (na.parents || [])) if (p.symbol === nb.symbol) { rel = p.relation; break }
+        if (!rel) for (const p of (nb.parents || [])) if (p.symbol === na.symbol) { rel = p.relation; break }
+        edgeRelations.push(rel || 'peer')
+      }
     }
   }
-  // Child -> primary spokes
+  // Child -> primary spokes, relation lookup from the child's parents list.
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i]
     if (n.tier !== 2 || !n.parentSym) continue
@@ -776,14 +831,28 @@ function buildEdges() {
     if (pi < 0) continue
     const lo = Math.min(i, pi), hi = Math.max(i, pi)
     const key = lo * 8192 + hi
-    if (!seen.has(key)) { seen.add(key); edgePairs.push([lo, hi]) }
+    if (!seen.has(key)) {
+      seen.add(key)
+      edgePairs.push([lo, hi])
+      let rel = null
+      for (const p of (n.parents || [])) if (p.symbol === parent.symbol) { rel = p.relation; break }
+      edgeRelations.push(rel || 'peer')
+    }
   }
 
   const positions = new Float32Array(edgePairs.length * 2 * 3)
+  const colors = new Float32Array(edgePairs.length * 2 * 3)
+  for (let i = 0; i < edgePairs.length; i++) {
+    const c = RELATION_COLORS[edgeRelations[i]] || DEFAULT_EDGE_COLOR
+    const o = i * 6
+    colors[o]     = c[0]; colors[o + 1] = c[1]; colors[o + 2] = c[2]
+    colors[o + 3] = c[0]; colors[o + 4] = c[1]; colors[o + 5] = c[2]
+  }
   const geom = new THREE.BufferGeometry()
   geom.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3))
   const mat = new THREE.LineBasicMaterial({
-    color: 0xffffff, transparent: true, opacity: 0.22, depthWrite: false,
+    vertexColors: true, transparent: true, opacity: 0.28, depthWrite: false,
   })
   edgeMesh = new THREE.LineSegments(geom, mat)
   scene.add(edgeMesh)
@@ -1017,12 +1086,26 @@ function computeDivergence(c) {
     _divGroupMean.set(g, m)
     _divGroupStd.set(g, std)
   }
-  // Pass 3: divergence score per node.
+  // Pass 3: divergence score per node + leaderboard of the top extremes.
+  const leaderInputs = []
   for (const n of nodes) {
     const m = _divGroupMean.get(n.group) ?? 0
     const s = _divGroupStd.get(n.group) ?? 1
     n.diverg = (recent.get(n.symbol) - m) / s
+    // Only surface primaries in the leaderboard so the list stays
+    // actionable (tier-2 kids are implicit via their parent).
+    if ((n.tier ?? 1) <= 1) leaderInputs.push(n)
   }
+  leaderInputs.sort((a, b) => b.diverg - a.diverg)
+  const up = leaderInputs.slice(0, 5).map(n => ({
+    symbol: n.symbol, group: n.group, diverg: n.diverg,
+    price: n.rawPrices[Math.min(c, n.rawPrices.length - 1)],
+  }))
+  const down = leaderInputs.slice(-5).reverse().map(n => ({
+    symbol: n.symbol, group: n.group, diverg: n.diverg,
+    price: n.rawPrices[Math.min(c, n.rawPrices.length - 1)],
+  }))
+  divergLeaders.value = { up, down }
 }
 
 const _tmpColor = new THREE.Color()
@@ -1095,13 +1178,19 @@ function animate(t) {
   updateEdges()
   updateBlanket(t * 0.001)
   updateFlow(dt)
+  applyFocus()
   updateWind(cursor.value)
   if (predict.value) updateGhosts(cursor.value)
   if (loaded.value) updateLabels()
 
-  // Slow camera yaw for god's-eye feel
-  const camR = 160
-  const camY = 78
+  // Intro dolly: on first loaded frame, start the camera pulled far back
+  // and ease in over ~2s so the scene reveals itself.
+  if (loaded.value && animate._introStart == null) animate._introStart = t
+  const intro = animate._introStart == null ? 0
+    : Math.min(1, (t - animate._introStart) / 2200)
+  const eased = 1 - Math.pow(1 - intro, 3)          // ease-out cubic
+  const camR = 160 + (300 - 160) * (1 - eased)      // 300 -> 160
+  const camY = 78  + (160 - 78)  * (1 - eased)      // 160 -> 78
   const theta = t * 0.00006
   camera.position.x = Math.sin(theta) * camR
   camera.position.z = Math.cos(theta) * camR
@@ -1238,6 +1327,44 @@ function onPointerMove(evt) {
 }
 function onPointerLeave() { hovered.value = null }
 
+function onPointerDown(evt) {
+  if (evt.button !== 0) return
+  if (!renderer || !camera || !nodes.length) return
+  const canvas = renderer.domElement
+  const rect = canvas.getBoundingClientRect()
+  ndcVec.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1
+  ndcVec.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1
+  raycaster.setFromCamera(ndcVec, camera)
+  if (lastHoverMeshes.length !== nodes.length) lastHoverMeshes = nodes.map(n => n.mesh)
+  const hits = raycaster.intersectObjects(lastHoverMeshes, false)
+  if (!hits.length) { focused.value = null; return }
+  const node = nodes.find(n => n.mesh === hits[0].object)
+  if (!node) { focused.value = null; return }
+  if ((node.tier ?? 1) === 2) return // skip focusing tier-2 for now
+  focused.value = focused.value === node.symbol ? null : node.symbol
+}
+
+// Dim everything that isn't the focused primary / its children / anchors.
+function applyFocus() {
+  const f = focused.value
+  if (f == null) {
+    for (const n of nodes) {
+      n.mesh.material.opacity = (n.tier === 2 ? 0.78 : 1.0)
+    }
+    if (edgeMesh) edgeMesh.material.opacity = 0.22
+    return
+  }
+  for (const n of nodes) {
+    const inFocus =
+      n.symbol === f ||
+      n.parentSym === f ||
+      (n.tier === 0)       // keep anchors visible as reference
+    n.mesh.material.transparent = true
+    n.mesh.material.opacity = inFocus ? 1.0 : 0.12
+  }
+  if (edgeMesh) edgeMesh.material.opacity = 0.09
+}
+
 // Helper to format the live price under the hover panel.
 const hoverPrice = computed(() => {
   const h = hovered.value
@@ -1267,6 +1394,7 @@ onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   canvas.addEventListener('pointermove', onPointerMove)
   canvas.addEventListener('pointerleave', onPointerLeave)
+  canvas.addEventListener('pointerdown', onPointerDown)
 
   await loadData()
   animate(0)
@@ -1313,6 +1441,90 @@ onBeforeUnmount(() => {
   opacity: 0.7;
   margin-top: 2px;
 }
+.ss-legend {
+  position: absolute;
+  top: 60px;
+  right: 20px;
+  padding: 8px 10px 9px;
+  background: rgba(5, 8, 15, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+.ss-legend-title {
+  font-size: 8px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 4px;
+}
+.ss-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  line-height: 1.5;
+  opacity: 0.8;
+}
+.ss-swatch {
+  display: inline-block;
+  width: 10px;
+  height: 2px;
+  border-radius: 1px;
+}
+.ss-leader {
+  position: absolute;
+  bottom: 80px;
+  right: 20px;
+  width: 240px;
+  padding: 10px 12px 12px;
+  background: rgba(5, 8, 15, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  color: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+.ss-leader-title {
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  margin-bottom: 6px;
+}
+.ss-leader-cols {
+  display: flex;
+  gap: 8px;
+}
+.ss-leader-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ss-leader-head {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  opacity: 0.85;
+  margin-bottom: 3px;
+}
+.ss-leader-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  padding: 1px 0;
+}
+.ss-leader-row.ss-up     .ss-leader-sym { color: #6fffb2; }
+.ss-leader-row.ss-down   .ss-leader-sym { color: #ff6f80; }
+.ss-leader-head.ss-up    { color: #6fffb2; }
+.ss-leader-head.ss-down  { color: #ff6f80; }
+.ss-leader-val { opacity: 0.7; }
 .ss-hover-panel {
   position: fixed;
   min-width: 180px;
