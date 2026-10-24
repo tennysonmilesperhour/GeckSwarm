@@ -1,6 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    { "source": "/((?!assets/|stock-swarm/|icon\\.png).*)", "destination": "/index.html" }
-  ]
+    {
+      "source": "/((?!assets/|stock-swarm/|icon\\.png).*)",
+      "destination": "/index.html"
+    }
+  ],
+  "installCommand": "npx --yes npm@12.2.1 ci --ignore-scripts"
 }
